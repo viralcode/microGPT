@@ -44,6 +44,7 @@ microGPT is a **from-scratch LLM training framework** implementing every major i
 | ✅ **Gradient Checkpointing** | ~60% memory reduction | Universal |
 | 📈 **WSD LR Schedule** | Warmup-Stable-Decay for better convergence | DeepSeek V3 |
 | 📦 **GGUF Export** | Run your model in llama.cpp / Ollama | llama.cpp |
+| 🧬 **Knowledge Distillation** | Transfer knowledge from large to small model | DeepSeek R1, Qwen |
 | 🌐 **FSDP** | Multi-GPU training | PyTorch |
 
 ## Quick Start
@@ -254,6 +255,21 @@ config = GPTConfig(
 )
 ```
 
+## Knowledge Distillation
+
+Transfer knowledge from a large teacher model to a smaller student model (same technique used by DeepSeek R1 Distill, Qwen):
+
+```bash
+# Distill a large model into a small one
+python distill.py --teacher checkpoints/large.pt --student-preset small --data data/
+
+# Custom temperature and balance (alpha=0.7 means 70% KD, 30% CE)
+python distill.py --teacher large.pt --student-preset small --temperature 3.0 --alpha 0.7
+
+# Generate with the distilled model
+python generate.py --checkpoint checkpoints/distilled_best.pt --interactive
+```
+
 ## Project Structure
 
 ```
@@ -264,6 +280,7 @@ microGPT/
 ├── train.py            # Training (AdamW, cosine/WSD LR, FSDP, grad ckpt, mixed prec)
 ├── generate.py         # Generation (top-k/p, min-p, rep penalty, speculative decoding)
 ├── align.py            # DPO alignment from preference pairs
+├── distill.py          # Knowledge distillation (teacher → student)
 ├── lora.py             # LoRA: apply, merge, save, load
 ├── finetune.py         # LoRA fine-tuning script
 ├── export.py           # GGUF export (FP16, Q8_0, Q4_0)

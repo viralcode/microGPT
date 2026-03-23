@@ -97,14 +97,30 @@ def get_dtype(config: TrainConfig, device: str):
 
 
 def get_lr(it: int, config: TrainConfig) -> float:
-    """Cosine learning rate schedule with linear warmup."""
-    if it < config.warmup_iters:
-        return config.learning_rate * it / config.warmup_iters
-    if it > config.lr_decay_iters:
-        return config.min_lr
-    decay_ratio = (it - config.warmup_iters) / (config.lr_decay_iters - config.warmup_iters)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return config.min_lr + coeff * (config.learning_rate - config.min_lr)
+    """Learning rate schedule: cosine or WSD (warmup-stable-decay)."""
+    if config.lr_schedule == "wsd":
+        # Warmup-Stable-Decay (DeepSeek V3)
+        # Phase 1: Linear warmup
+        if it < config.warmup_iters:
+            return config.learning_rate * it / config.warmup_iters
+        # Phase 2: Stable at peak LR
+        stable_end = int(config.lr_decay_iters * config.wsd_stable_fraction)
+        if it < stable_end:
+            return config.learning_rate
+        # Phase 3: Cosine decay to min_lr
+        decay_ratio = (it - stable_end) / max(1, config.lr_decay_iters - stable_end)
+        decay_ratio = min(decay_ratio, 1.0)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return config.min_lr + coeff * (config.learning_rate - config.min_lr)
+    else:
+        # Cosine schedule with linear warmup
+        if it < config.warmup_iters:
+            return config.learning_rate * it / config.warmup_iters
+        if it > config.lr_decay_iters:
+            return config.min_lr
+        decay_ratio = (it - config.warmup_iters) / (config.lr_decay_iters - config.warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
 
 def load_data(data_dir: str, split: str, block_size: int, batch_size: int, device: str):
@@ -198,6 +214,9 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
                   f"{model_config.n_shared_experts} shared ({routing})")
         if model_config.n_predict_tokens > 1:
             print(f"  MTP:          {model_config.n_predict_tokens} tokens")
+        print(f"  LR Schedule:  {train_config.lr_schedule.upper()}")
+        if train_config.gradient_checkpointing:
+            print(f"  Grad Ckpt:    ON (memory-efficient)")
         print(f"{'='*60}\n")
 
     # ── Load tokenizer metadata ───────────────────────────────────────────
@@ -244,6 +263,13 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
         if is_main_process():
             print("Compiling model with torch.compile()...")
         model = torch.compile(model)
+
+    # ── Enable gradient checkpointing ─────────────────────────────────────
+    if train_config.gradient_checkpointing:
+        raw_model_temp = model.module if hasattr(model, "module") else model
+        raw_model_temp.enable_gradient_checkpointing()
+        if is_main_process():
+            print("Gradient checkpointing enabled (memory-efficient mode)")
 
     # ── Optimizer ─────────────────────────────────────────────────────────
     decay_params = []
@@ -297,6 +323,7 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
     os.makedirs(train_config.checkpoint_dir, exist_ok=True)
     t0 = time.time()
     raw_model = model.module if hasattr(model, "module") else model
+    ema_loss = None  # Exponential moving average of training loss
 
     for iter_num in range(start_iter, train_config.max_iters):
         # Set learning rate
@@ -367,10 +394,23 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
         scaler.step(optimizer)
         scaler.update()
 
+        # Track EMA loss for smooth logging
+        batch_loss = (loss * train_config.gradient_accumulation_steps).item()
+        if ema_loss is None:
+            ema_loss = batch_loss
+        else:
+            ema_loss = 0.95 * ema_loss + 0.05 * batch_loss
+
         # Timing
         if iter_num % 100 == 0 and is_main_process():
             t1 = time.time()
             dt = t1 - t0
+            tokens_per_sec = (
+                train_config.batch_size * model_config.block_size
+                * train_config.gradient_accumulation_steps * 100 / dt
+            )
+            print(f"  iter {iter_num:>6d} | loss {ema_loss:.4f} "
+                  f"| {tokens_per_sec:.0f} tok/s | lr {lr:.2e}")
             t0 = t1
 
     # ── Final save ────────────────────────────────────────────────────────
@@ -417,6 +457,11 @@ if __name__ == "__main__":
                         help="Use torch.compile (PyTorch 2.0+)")
     parser.add_argument("--distributed", action="store_true",
                         help="Enable FSDP multi-GPU training (use with torchrun)")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing (saves ~60%% memory)")
+    parser.add_argument("--lr-schedule", type=str, default="cosine",
+                        choices=["cosine", "wsd"],
+                        help="LR schedule: cosine (default) or wsd (warmup-stable-decay)")
 
     args = parser.parse_args()
 
@@ -431,6 +476,8 @@ if __name__ == "__main__":
         device=args.device,
         compile_model=args.compile,
         distributed=args.distributed,
+        gradient_checkpointing=args.gradient_checkpointing,
+        lr_schedule=args.lr_schedule,
     )
 
     train(model_config, train_config)

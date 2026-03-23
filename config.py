@@ -24,6 +24,15 @@ class GPTConfig:
     use_rope: bool = True        # Use Rotary Positional Embeddings
     use_swiglu: bool = True      # Use SwiGLU activation
 
+    # ── Sliding Window Attention (Mistral / Gemma 2) ─────────────────────
+    sliding_window: int = 0      # 0 = full attention, >0 = window size
+    alternating_layers: bool = False  # Even=global, Odd=local (Gemma 2)
+    attn_logit_cap: float = 0.0  # 0 = disabled, >0 = soft cap (Gemma 2)
+
+    # ── Context Extension (YaRN / NTK) ───────────────────────────────────
+    rope_scaling_type: str = "none"   # "none", "linear", "yarn"
+    rope_scaling_factor: float = 1.0  # e.g. 4.0 = extends 4K ctx to 16K
+
     # ── Multi-head Latent Attention (MLA) — DeepSeek V3 ──────────────────
     use_mla: bool = False        # Enable MLA (replaces GQA/MHA attention)
     kv_lora_rank: int = 512      # Latent dimension for KV compression
@@ -49,6 +58,11 @@ class GPTConfig:
     # ── Multi-Token Prediction (MTP) — DeepSeek V3 ──────────────────────
     n_predict_tokens: int = 1    # Tokens to predict (1=standard, >1=MTP)
     mtp_loss_weight: float = 1.0 # Weight for MTP losses relative to main loss
+
+    # ── LoRA ─────────────────────────────────────────────────────────────
+    lora_rank: int = 0           # 0 = disabled, >0 = LoRA rank
+    lora_alpha: float = 16.0     # LoRA scaling factor
+    lora_dropout: float = 0.0    # Dropout on LoRA layers
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -83,6 +97,11 @@ class TrainConfig:
     device: str = "auto"
     dtype: str = "auto"
     compile_model: bool = False
+    gradient_checkpointing: bool = False
+
+    # Learning rate schedule
+    lr_schedule: str = "cosine"  # "cosine" or "wsd" (warmup-stable-decay)
+    wsd_stable_fraction: float = 0.8  # Fraction of training at stable LR (WSD only)
 
     # Distributed training (FSDP)
     distributed: bool = False
@@ -131,13 +150,25 @@ PRESETS = {
         # MTP
         n_predict_tokens=1,
     ),
+    "mistral": GPTConfig(
+        n_layer=32, n_head=32, n_kv_head=8, n_embd=4096,
+        block_size=8192, dropout=0.0, bias=False,
+        sliding_window=4096,
+    ),
+    "gemma2": GPTConfig(
+        n_layer=28, n_head=16, n_kv_head=4, n_embd=2304,
+        block_size=8192, dropout=0.0, bias=False,
+        sliding_window=4096, alternating_layers=True,
+        attn_logit_cap=50.0,
+    ),
 }
 
 
 def get_model_config(preset: str = "small", **overrides) -> GPTConfig:
     """Get a model config from a preset, with optional overrides."""
     if preset not in PRESETS:
-        raise ValueError(f"Unknown preset '{preset}'. Choose from: {list(PRESETS.keys())}")
+        raise ValueError(f"Unknown preset '{preset}'. "
+                         f"Choose from: {list(PRESETS.keys())}")
     config = PRESETS[preset]
     for key, value in overrides.items():
         if hasattr(config, key):

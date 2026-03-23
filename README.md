@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">🔥 NanoForge</h1>
-  <p align="center"><strong>Train your own LLM from scratch — with GPT-4 & DeepSeek V3 architecture</strong></p>
+  <p align="center"><strong>Train your own LLM from scratch — with every frontier innovation</strong></p>
   <p align="center">
-    <em>Every frontier innovation. Zero abstraction layers. Pure PyTorch.</em>
+    <em>GPT-4 • DeepSeek V3 • Gemma 2 • Mistral • LLaMA 3 — Zero abstraction. Pure PyTorch.</em>
   </p>
 </p>
 
@@ -10,28 +10,41 @@
   <a href="#quick-start">Quick Start</a> •
   <a href="#architecture">Architecture</a> •
   <a href="#presets">Presets</a> •
-  <a href="#deepseek-v3-innovations">DeepSeek V3</a> •
-  <a href="#alignment">Alignment</a>
+  <a href="#generation">Generation</a> •
+  <a href="#lora-fine-tuning">LoRA</a> •
+  <a href="#alignment">Alignment</a> •
+  <a href="#export">Export</a>
 </p>
 
 ---
 
-NanoForge is a **from-scratch LLM training framework** that implements the same architectural innovations found in GPT-4, DeepSeek V3, LLaMA 3, and Mistral — in ~600 lines of readable PyTorch. Train on any text, scale from laptop to GPU cluster, then align with human preferences.
+NanoForge is a **from-scratch LLM training framework** implementing every major innovation from GPT-4 through DeepSeek V3, Gemma 2, and Mistral — in readable PyTorch. Train on any text, scale from laptop to GPU cluster, fine-tune with LoRA, align with DPO, export to GGUF.
 
 ## Architecture
 
 | Innovation | What It Does | Origin |
 |-----------|-------------|--------|
-| 🧠 **Multi-head Latent Attention (MLA)** | Compresses KV into low-rank latent space — **~10x smaller cache** | DeepSeek V3 |
-| 🔄 **Grouped Query Attention (GQA)** | Fewer KV heads → faster inference, less memory | GPT-4, LLaMA |
+| 🧠 **Multi-head Latent Attention (MLA)** | Compresses KV into low-rank latent — **~10x smaller cache** | DeepSeek V3 |
+| 🔄 **Grouped Query Attention (GQA)** | Fewer KV heads → faster, less memory | GPT-4, LLaMA |
+| 🪟 **Sliding Window Attention** | O(n·w) attention — handles very long sequences | Mistral |
+| 🔄 **Alternating Global/Local Layers** | Even=full attention, odd=windowed — best of both | Gemma 2 |
+| 🛡️ **Logit Soft-Capping** | Prevents attention logit explosion | Gemma 2 |
+| ⚡ **Flash Attention** | 2-4x faster via PyTorch SDPA backend | FlashAttention-2 |
 | 🧩 **DeepSeekMoE** | Shared + routed experts with sigmoid gating | DeepSeek V3 |
-| ⚖️ **Aux-Loss-Free Routing** | Dynamic bias replaces aux loss — **better model quality** | DeepSeek V3 |
-| 🔮 **Multi-Token Prediction** | Predicts N+1, N+2... tokens — denser training gradients | DeepSeek V3 |
-| ⚡ **KV-Cache** | Incremental decoding — O(1) per token instead of O(n) | Universal |
-| 📐 **Decoupled RoPE** | Separates positional info from semantic attention | DeepSeek V3 |
-| 🔥 **SwiGLU + RMSNorm** | Modern FFN activation + stable normalization | GPT-4, LLaMA |
-| 🎯 **DPO Alignment** | Align with human preferences — no reward model needed | LLaMA 3, Zephyr |
-| 🌐 **FSDP** | Multi-GPU training via FullyShardedDataParallel | PyTorch |
+| ⚖️ **Aux-Loss-Free Routing** | Dynamic bias replaces aux loss | DeepSeek V3 |
+| 🔮 **Multi-Token Prediction** | Predicts N+1, N+2... — denser gradients | DeepSeek V3 |
+| 📐 **Decoupled RoPE** | Separates position from content attention | DeepSeek V3 |
+| 🌐 **YaRN Context Extension** | Extend context window without retraining | LLaMA 3.1, Qwen |
+| 🔥 **SwiGLU + RMSNorm** | Modern FFN + stable normalization | GPT-4, LLaMA |
+| 💾 **KV-Cache** | O(1) per token incremental decoding | Universal |
+| 🎯 **DPO Alignment** | Align with preferences — no reward model | LLaMA 3, Zephyr |
+| 🔧 **LoRA Fine-tuning** | 100x fewer params to train | Microsoft |
+| 🏎️ **Speculative Decoding** | 2-3x faster inference with draft model | Google/DeepMind |
+| 🎲 **Top-p / Min-p / Rep Penalty** | Advanced sampling strategies | All frontier models |
+| ✅ **Gradient Checkpointing** | ~60% memory reduction | Universal |
+| 📈 **WSD LR Schedule** | Warmup-Stable-Decay for better convergence | DeepSeek V3 |
+| 📦 **GGUF Export** | Run your model in llama.cpp / Ollama | llama.cpp |
+| 🌐 **FSDP** | Multi-GPU training | PyTorch |
 
 ## Quick Start
 
@@ -60,57 +73,74 @@ python train.py --preset medium
 
 ## Presets
 
-| Preset | Params | Attention | MoE | Context | Best For |
+| Preset | Params | Attention | MoE | Special | Best For |
 |--------|--------|-----------|-----|---------|----------|
-| `small` | ~35M | MHA | — | 256 | CPU / laptop testing |
-| `medium` | ~125M | GQA 12Q/4KV | — | 512 | Single GPU |
-| `large` | ~333M | GQA 16Q/4KV | — | 2048 | Good GPU (A100/4090) |
-| `xl` | ~1.3B | GQA 16Q/8KV | — | 4096 | Multi-GPU |
-| `gpt4` | ~100B | GQA 32Q/8KV | 8×top-2 | 8192 | GPU cluster |
-| `deepseek` | variable | **MLA** | 64×top-6 + 2 shared | 4096 | GPU cluster (DeepSeek V3 arch) |
+| `small` | ~35M | MHA | — | — | CPU / laptop |
+| `medium` | ~125M | GQA 12Q/4KV | — | — | Single GPU |
+| `large` | ~333M | GQA 16Q/4KV | — | — | A100/4090 |
+| `xl` | ~1.3B | GQA 16Q/8KV | — | — | Multi-GPU |
+| `gpt4` | ~100B | GQA 32Q/8KV | 8×top-2 | — | GPU cluster |
+| `deepseek` | variable | **MLA** | 64×top-6+2shared | aux-free, MTP | GPU cluster |
+| `mistral` | ~7B | GQA 32Q/8KV | — | **sliding window 4K** | GPU cluster |
+| `gemma2` | ~2.7B | GQA 16Q/4KV | — | **alternating layers, logit cap** | GPU cluster |
 
 ```bash
 # Scale up as your hardware allows
-python train.py --preset small          # Laptop
-python train.py --preset medium         # 1× GPU
-python train.py --preset large          # 1× A100
+python train.py --preset small                    # Laptop
+python train.py --preset medium                   # 1× GPU
+python train.py --preset large --gradient-checkpointing  # Memory-efficient
+
+# Training options
+python train.py --preset medium --lr-schedule wsd  # DeepSeek V3 LR schedule
+python train.py --preset large --gradient-checkpointing --compile  # Max efficiency
 
 # Multi-GPU with FSDP
 torchrun --nproc_per_node=4 train.py --preset xl --distributed
 torchrun --nproc_per_node=8 train.py --preset deepseek --distributed
 ```
 
-## DeepSeek V3 Innovations
+## Generation
 
-NanoForge implements the three core innovations from the [DeepSeek V3 paper](https://arxiv.org/abs/2412.19437):
+```bash
+# Standard generation
+python generate.py --prompt "Once upon a time" --interactive
 
-### Multi-head Latent Attention (MLA)
+# Advanced sampling
+python generate.py --prompt "Once" --top-p 0.9 --min-p 0.05 --rep-penalty 1.2
 
-Standard attention caches full K,V per head. MLA compresses them into a tiny latent vector:
-
-```
-Input → W_KV_A → [c_KV (latent), k_rope (position)]
-                       ↓
-                    RMSNorm
-                       ↓
-                W_KV_B → [k_content, v]  (per head, on-the-fly)
-
-Cache stores only (c_KV, k_rope) → ~10x smaller than GQA
+# Speculative decoding (2-3x faster!)
+# Train a small draft model first, then:
+python generate.py --draft-checkpoint checkpoints/small.pt --spec-k 5
 ```
 
-### Aux-Loss-Free MoE with Shared Experts
+### Sampling Strategies
 
-- **Shared experts** process every token (stable base knowledge)
-- **Routed experts** are selected top-k per token (specialization)
-- Dynamic bias `b_i` adjusts routing without polluting the loss function
+| Strategy | Flag | Description |
+|----------|------|-------------|
+| Top-k | `--top-k 50` | Keep top-k highest probability tokens |
+| Top-p (nucleus) | `--top-p 0.9` | Keep tokens until cumulative probability reaches p |
+| Min-p | `--min-p 0.05` | Filter tokens below 5% of the max probability |
+| Repetition penalty | `--rep-penalty 1.2` | Reduce probability of repeated tokens |
+| Temperature | `--temperature 0.8` | Control randomness (0=greedy, 1=diverse) |
 
-### Multi-Token Prediction (MTP)
+## LoRA Fine-tuning
 
-Each training step predicts multiple future tokens (not just the next one), providing denser gradients. MTP modules are **discarded at inference** — zero overhead.
+Fine-tune with only ~1-3% trainable parameters:
+
+```bash
+# Fine-tune a pre-trained model
+python finetune.py --checkpoint checkpoints/best.pt --data data/ --lora-rank 16
+
+# Custom LoRA settings
+python finetune.py --checkpoint best.pt --data data/ --lora-rank 32 --lora-alpha 64
+
+# Generate with fine-tuned model
+python generate.py --checkpoint checkpoints/finetuned_merged.pt --interactive
+```
 
 ## Alignment
 
-Align your model with human preferences using Direct Preference Optimization (DPO):
+Align your model with human preferences using DPO:
 
 ```bash
 # Create preference data (JSONL):
@@ -120,15 +150,48 @@ python align.py --checkpoint checkpoints/best.pt --data preferences.jsonl
 python generate.py --checkpoint checkpoints/aligned.pt --interactive
 ```
 
+## Export
+
+Export to GGUF format for use with llama.cpp, Ollama, LM Studio:
+
+```bash
+# FP16 (full quality)
+python export.py --checkpoint best.pt --output model-fp16.gguf
+
+# Q8_0 (8-bit quantized, good quality, smaller)
+python export.py --checkpoint best.pt --output model-q8.gguf --quantize q8_0
+
+# Q4_0 (4-bit quantized, smallest, fastest)
+python export.py --checkpoint best.pt --output model-q4.gguf --quantize q4_0
+```
+
+## Context Extension (YaRN)
+
+Extend your model's context window at inference without retraining:
+
+```python
+from config import GPTConfig
+
+config = GPTConfig(
+    ...,
+    rope_scaling_type="yarn",   # or "linear"
+    rope_scaling_factor=4.0,    # 4x context: 4K → 16K
+)
+```
+
 ## Project Structure
 
 ```
 nanoforge/
-├── model.py            # MLA, GQA, DeepSeekMoE, MTP, KV-cache, RoPE, SwiGLU
-├── config.py           # All hyperparameters + presets (small → deepseek)
-├── train.py            # Training loop (AdamW, cosine LR, FSDP, mixed precision)
-├── generate.py         # Text generation with KV-cache
+├── model.py            # MLA, GQA, sliding window, Flash Attn, MoE, MTP, KV-cache,
+│                       # RoPE+YaRN, SwiGLU, speculative decoding, grad checkpointing
+├── config.py           # All hyperparameters + presets (small → gemma2)
+├── train.py            # Training (AdamW, cosine/WSD LR, FSDP, grad ckpt, mixed prec)
+├── generate.py         # Generation (top-k/p, min-p, rep penalty, speculative decoding)
 ├── align.py            # DPO alignment from preference pairs
+├── lora.py             # LoRA: apply, merge, save, load
+├── finetune.py         # LoRA fine-tuning script
+├── export.py           # GGUF export (FP16, Q8_0, Q4_0)
 ├── data/
 │   └── prepare_data.py # Tokenization (tiktoken BPE or character-level)
 └── requirements.txt
@@ -136,16 +199,21 @@ nanoforge/
 
 ## What This Is (and Isn't)
 
-**This is**: A research-grade LLM training framework implementing the same architecture as GPT-4 and DeepSeek V3. Every innovation is implemented from scratch in readable PyTorch — no hidden abstractions.
+**This is**: The most comprehensive from-scratch LLM framework, implementing every major innovation from GPT-4 through the latest frontier models. Every feature is implemented in readable PyTorch — no hidden abstractions.
 
-**This isn't**: A pretrained model. The architecture is frontier-level, but producing a ChatGPT-quality model requires training on trillions of tokens across thousands of GPUs. This gives you the blueprint; you provide the compute.
+**This isn't**: A pretrained model. The architecture is frontier-level, but producing a ChatGPT-quality model requires trillions of tokens and thousands of GPUs. This gives you the complete blueprint; you provide the compute.
 
 ## References
 
-- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) — MLA, DeepSeekMoE, Multi-Token Prediction
+- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) — MLA, DeepSeekMoE, MTP, WSD schedule
+- [Gemma 2 Technical Report](https://arxiv.org/abs/2408.00118) — Alternating attention, logit soft-capping
+- [Mistral 7B](https://arxiv.org/abs/2310.06825) — Sliding window attention
 - [GPT-4 Technical Report](https://arxiv.org/abs/2303.08774) — MoE, GQA
 - [LLaMA 2](https://arxiv.org/abs/2307.09288) — GQA, SwiGLU, RMSNorm, RoPE
-- [DPO: Direct Preference Optimization](https://arxiv.org/abs/2305.18290) — Alignment
+- [YaRN](https://arxiv.org/abs/2309.00071) — Context extension via RoPE scaling
+- [LoRA](https://arxiv.org/abs/2106.09685) — Low-rank adaptation
+- [DPO](https://arxiv.org/abs/2305.18290) — Direct Preference Optimization
+- [Speculative Decoding](https://arxiv.org/abs/2302.01318) — Draft-verify acceleration
 - [nanoGPT](https://github.com/karpathy/nanoGPT) — Inspiration
 
 ## License

@@ -4,6 +4,12 @@ GPT Text Generation / Inference
 Load a trained GPT model checkpoint and generate text.
 Uses KV-cache for fast autoregressive generation.
 
+Features:
+  - Top-k, Top-p (nucleus), Min-p sampling
+  - Repetition penalty
+  - Speculative decoding with draft model
+  - KV-cache for fast generation
+
 Usage:
     # Generate text with default settings:
     python generate.py
@@ -11,8 +17,11 @@ Usage:
     # Interactive prompt mode:
     python generate.py --interactive
 
-    # Custom generation parameters:
-    python generate.py --prompt "Once upon a time" --max-tokens 500 --temperature 0.8
+    # Advanced sampling:
+    python generate.py --prompt "Once" --top-p 0.9 --min-p 0.05 --rep-penalty 1.2
+
+    # Speculative decoding (2-3x faster):
+    python generate.py --draft-checkpoint checkpoints/small.pt --spec-k 5
 
     # Disable KV-cache (for debugging):
     python generate.py --no-cache
@@ -27,7 +36,7 @@ import pickle
 import torch
 
 from config import GPTConfig
-from model import GPT
+from model import GPT, SpeculativeGenerator
 
 
 def load_model(checkpoint_path: str, device: str):
@@ -52,18 +61,26 @@ def load_model(checkpoint_path: str, device: str):
     alignment = checkpoint.get("alignment", None)
     if alignment:
         print(f"Loaded aligned model ({alignment['method'].upper()}, "
-              f"β={alignment['beta']}) from iteration {iter_num}")
+              f"\u03b2={alignment['beta']}) from iteration {iter_num}")
     else:
         print(f"Loaded model from iteration {iter_num} (val loss: {val_loss})")
 
     # Print architecture features
     features = []
-    if config.n_kv_head < config.n_head:
+    if config.use_mla:
+        features.append(f"MLA(kv_rank={config.kv_lora_rank})")
+    elif config.n_kv_head < config.n_head:
         features.append(f"GQA {config.n_head}Q/{config.n_kv_head}KV")
+    if config.sliding_window > 0:
+        sw_type = "alternating" if config.alternating_layers else "full"
+        features.append(f"SlidingWindow({config.sliding_window}, {sw_type})")
     if config.use_moe:
         features.append(f"MoE {config.n_experts_active}/{config.n_experts}")
     if config.use_rope:
-        features.append("RoPE")
+        rope_info = "RoPE"
+        if config.rope_scaling_type != "none":
+            rope_info += f"-{config.rope_scaling_type.upper()}({config.rope_scaling_factor}x)"
+        features.append(rope_info)
     if config.use_swiglu:
         features.append("SwiGLU")
     if features:
@@ -109,8 +126,12 @@ def generate_text(
     max_new_tokens: int = 200,
     temperature: float = 0.8,
     top_k: int = 50,
+    top_p: float = None,
+    min_p: float = None,
+    repetition_penalty: float = 1.0,
     device: str = "cpu",
     use_cache: bool = True,
+    spec_generator=None,
 ):
     """Generate text from a prompt. Returns text and generation stats."""
     # Encode the prompt
@@ -120,11 +141,19 @@ def generate_text(
     # Generate with timing
     t0 = time.time()
     with torch.no_grad():
-        y = model.generate(
-            x, max_new_tokens=max_new_tokens,
-            temperature=temperature, top_k=top_k,
-            use_cache=use_cache,
-        )
+        if spec_generator is not None:
+            y = spec_generator.generate(
+                x, max_new_tokens=max_new_tokens,
+                temperature=temperature, top_k=top_k,
+            )
+        else:
+            y = model.generate(
+                x, max_new_tokens=max_new_tokens,
+                temperature=temperature, top_k=top_k,
+                top_p=top_p, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                use_cache=use_cache,
+            )
     t1 = time.time()
 
     # Decode
@@ -159,12 +188,24 @@ def main():
                         help="Sampling temperature (0.0 = greedy, 1.0 = diverse)")
     parser.add_argument("--top-k", type=int, default=50,
                         help="Top-k sampling (0 = no filtering)")
+    parser.add_argument("--top-p", type=float, default=None,
+                        help="Nucleus (top-p) sampling threshold (e.g. 0.9)")
+    parser.add_argument("--min-p", type=float, default=None,
+                        help="Min-p dynamic threshold (e.g. 0.05)")
+    parser.add_argument("--rep-penalty", type=float, default=1.0,
+                        help="Repetition penalty (>1 = less repetition)")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device: auto, cuda, mps, cpu")
     parser.add_argument("--interactive", action="store_true",
                         help="Interactive mode: enter prompts continuously")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable KV-cache (for debugging)")
+
+    # Speculative decoding
+    parser.add_argument("--draft-checkpoint", type=str, default=None,
+                        help="Path to draft model checkpoint for speculative decoding")
+    parser.add_argument("--spec-k", type=int, default=5,
+                        help="Number of speculative draft tokens (default: 5)")
 
     args = parser.parse_args()
 
@@ -191,12 +232,31 @@ def main():
     top_k = args.top_k if args.top_k > 0 else None
     use_cache = not args.no_cache
 
+    # Setup speculative decoding if draft model provided
+    spec_generator = None
+    if args.draft_checkpoint:
+        if not os.path.exists(args.draft_checkpoint):
+            print(f"Error: Draft checkpoint not found at {args.draft_checkpoint}")
+            sys.exit(1)
+        print(f"\nLoading draft model for speculative decoding (k={args.spec_k})...")
+        draft_model, _ = load_model(args.draft_checkpoint, device)
+        spec_generator = SpeculativeGenerator(model, draft_model, k=args.spec_k)
+        print("Speculative decoding enabled \u2713")
+
     if args.interactive:
         # ── Interactive mode ──────────────────────────────────────────────
+        sampling_info = f"T={args.temperature}"
+        if top_k: sampling_info += f" | top-k={top_k}"
+        if args.top_p: sampling_info += f" | top-p={args.top_p}"
+        if args.min_p: sampling_info += f" | min-p={args.min_p}"
+        if args.rep_penalty != 1.0: sampling_info += f" | rep={args.rep_penalty}"
+
         print(f"\n{'='*60}")
-        print(f"  GPT Interactive Generation")
-        print(f"  Temperature: {args.temperature} | Top-k: {top_k}")
+        print(f"  NanoForge Interactive Generation")
+        print(f"  Sampling: {sampling_info}")
         print(f"  KV-Cache: {'ON' if use_cache else 'OFF'}")
+        if spec_generator:
+            print(f"  Speculative Decoding: ON (k={args.spec_k})")
         print(f"  Type your prompt and press Enter. Type 'quit' to exit.")
         print(f"{'='*60}\n")
 
@@ -219,33 +279,50 @@ def main():
                 max_new_tokens=args.max_tokens,
                 temperature=args.temperature,
                 top_k=top_k,
+                top_p=args.top_p,
+                min_p=args.min_p,
+                repetition_penalty=args.rep_penalty,
                 device=device,
                 use_cache=use_cache,
+                spec_generator=spec_generator,
             )
 
+            mode = "spec" if spec_generator else ("cached" if use_cache else "no-cache")
             print(f"\nGPT> {text}")
             print(f"  [{stats['n_generated']} tokens, {stats['tokens_per_sec']:.1f} tok/s, "
-                  f"{'cached' if use_cache else 'no-cache'}]\n")
+                  f"{mode}]\n")
     else:
         # ── Single generation ─────────────────────────────────────────────
         print(f"\nPrompt: {repr(args.prompt)}")
-        print(f"Temperature: {args.temperature} | Top-k: {top_k} | "
-              f"KV-Cache: {'ON' if use_cache else 'OFF'}")
+        sampling_info = f"T={args.temperature}"
+        if top_k: sampling_info += f" | top-k={top_k}"
+        if args.top_p: sampling_info += f" | top-p={args.top_p}"
+        if args.min_p: sampling_info += f" | min-p={args.min_p}"
+        if args.rep_penalty != 1.0: sampling_info += f" | rep={args.rep_penalty}"
+        print(f"Sampling: {sampling_info}")
+        print(f"KV-Cache: {'ON' if use_cache else 'OFF'}")
+        if spec_generator:
+            print(f"Speculative Decoding: ON (k={args.spec_k})")
         print(f"Generating {args.max_tokens} tokens...\n")
-        print("─" * 60)
+        print("\u2500" * 60)
 
         text, stats = generate_text(
             model, tokenizer, prompt=args.prompt,
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=top_k,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            repetition_penalty=args.rep_penalty,
             device=device,
             use_cache=use_cache,
+            spec_generator=spec_generator,
         )
         print(text)
-        print("─" * 60)
+        print("\u2500" * 60)
+        mode = "speculative" if spec_generator else ("cached" if use_cache else "no-cache")
         print(f"  {stats['n_generated']} tokens in {stats['elapsed']:.2f}s "
-              f"({stats['tokens_per_sec']:.1f} tokens/sec)")
+              f"({stats['tokens_per_sec']:.1f} tokens/sec, {mode})")
 
 
 if __name__ == "__main__":

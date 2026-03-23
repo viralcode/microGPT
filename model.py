@@ -1,12 +1,17 @@
 """
-GPT-4 / DeepSeek V3 Architecture Transformer Model
-=====================================================
-A decoder-only transformer implementing innovations from GPT-4 and DeepSeek V3:
+NanoForge — Frontier LLM Architecture
+=======================================
+A decoder-only transformer implementing innovations from GPT-4, DeepSeek V3,
+Gemma 2, Mistral, LLaMA 3.1, and more:
 
 Attention:
   - Grouped Query Attention (GQA) — fewer KV heads for efficiency
   - Multi-head Latent Attention (MLA) — low-rank KV compression, ~10x cache reduction
   - Decoupled RoPE — separate positional dims from content dims
+  - Sliding Window Attention — O(n·w) instead of O(n²)  [Mistral]
+  - Alternating Global/Local Layers — even=full, odd=windowed  [Gemma 2]
+  - Logit Soft-Capping — prevents attention explosion  [Gemma 2]
+  - Flash Attention — via PyTorch SDPA backend
   - KV-Cache — incremental decoding for fast generation
 
 Feed-Forward / MoE:
@@ -14,13 +19,27 @@ Feed-Forward / MoE:
   - Mixture of Experts with shared experts (DeepSeek V3)
   - Auxiliary-loss-free load balancing via dynamic bias routing
 
+Context Extension:
+  - YaRN (Yet another RoPE extensioN) — extend context without retraining
+  - Linear RoPE scaling
+  - NTK-aware interpolation
+
+Generation:
+  - Top-k, Top-p (nucleus), Min-p sampling
+  - Repetition penalty
+  - Speculative decoding (draft-verify acceleration)
+  - KV-cache with Flash Attention
+
 Training:
   - Multi-Token Prediction (MTP) — denser training signal
   - RMSNorm pre-norm architecture
+  - Gradient checkpointing support
 
 References:
   - DeepSeek-V3 Technical Report (2024)
-  - GPT-4, LLaMA 2/3, Mistral, nanoGPT
+  - Gemma 2 Technical Report (2024)
+  - Mistral 7B (2023)
+  - GPT-4, LLaMA 2/3, nanoGPT
 """
 
 import math
@@ -45,13 +64,44 @@ class RMSNorm(nn.Module):
         return (x.float() * norm).type_as(x) * self.weight
 
 
-# ── Rotary Positional Embeddings (RoPE) ──────────────────────────────────────
+# ── Rotary Positional Embeddings (RoPE) with YaRN / Linear Scaling ────────
 
 class RotaryEmbedding(nn.Module):
-    """Rotary Positional Embeddings with arbitrary dim support."""
-    def __init__(self, dim: int, max_seq_len: int = 8192, base: float = 10000.0):
+    """Rotary Positional Embeddings with context extension support.
+
+    Supports:
+    - Standard RoPE
+    - Linear scaling (simple frequency division)
+    - YaRN (Yet another RoPE extensioN) — NTK-aware interpolation
+    """
+    def __init__(self, dim: int, max_seq_len: int = 8192, base: float = 10000.0,
+                 scaling_type: str = "none", scaling_factor: float = 1.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.dim = dim
+        self.scaling_type = scaling_type
+        self.scaling_factor = scaling_factor
+
+        if scaling_type == "yarn":
+            # YaRN: NTK-aware — modify base frequency
+            base = base * (
+                (scaling_factor * max_seq_len / max_seq_len) ** (dim / (dim - 2))
+            )
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+            # Apply wavelength-dependent scaling
+            freqs = torch.arange(0, dim, 2).float() / dim
+            # Low-frequency dims get linear interpolation,
+            # high-frequency dims keep original
+            wavelen = 2 * math.pi * base ** freqs
+            ratio = max_seq_len / wavelen
+            smooth = torch.clamp((ratio - 1) / (scaling_factor - 1), 0.0, 1.0)
+            yarn_scale = (1 - smooth) / scaling_factor + smooth
+            inv_freq = inv_freq * yarn_scale
+        elif scaling_type == "linear":
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+            inv_freq = inv_freq / scaling_factor
+        else:
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+
         self.register_buffer("inv_freq", inv_freq)
         self._build_cache(max_seq_len)
 
@@ -321,6 +371,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
         self.dropout_rate = config.dropout
+        self.attn_logit_cap = config.attn_logit_cap
 
         # Query projection (optionally compressed)
         if self.q_lora_rank == 0:
@@ -347,8 +398,12 @@ class MultiHeadLatentAttention(nn.Module):
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
 
         # RoPE for the decoupled positional dims
-        self.rotary_emb = RotaryEmbedding(self.qk_rope_head_dim,
-                                          max_seq_len=config.block_size)
+        self.rotary_emb = RotaryEmbedding(
+            self.qk_rope_head_dim,
+            max_seq_len=config.block_size,
+            scaling_type=config.rope_scaling_type,
+            scaling_factor=config.rope_scaling_factor,
+        )
 
         # Attention scale
         self.softmax_scale = self.qk_head_dim ** -0.5
@@ -435,6 +490,12 @@ class MultiHeadLatentAttention(nn.Module):
         total_T = k.shape[2]
         att = (q @ k.transpose(-2, -1)) * self.softmax_scale
 
+        # Logit soft-capping (Gemma 2)
+        if self.attn_logit_cap > 0:
+            att = att / self.attn_logit_cap
+            att = torch.tanh(att)
+            att = att * self.attn_logit_cap
+
         # Causal mask
         if past_kv is None and T > 1:
             causal = torch.triu(
@@ -454,12 +515,19 @@ class MultiHeadLatentAttention(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GROUPED QUERY ATTENTION (GQA) — GPT-4 / LLaMA style
+#  GROUPED QUERY ATTENTION (GQA) — GPT-4 / LLaMA / Mistral / Gemma 2
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CausalSelfAttention(nn.Module):
-    """Multi-Head Attention with GQA and KV-cache support."""
-    def __init__(self, config: GPTConfig):
+    """Multi-Head Attention with GQA, KV-cache, sliding window, and Flash Attention.
+
+    Supports:
+    - Full causal attention (default)
+    - Sliding window attention (Mistral)
+    - Logit soft-capping (Gemma 2)
+    - Flash Attention via PyTorch SDPA
+    """
+    def __init__(self, config: GPTConfig, layer_id: int = 0):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         assert config.n_head % config.n_kv_head == 0
@@ -471,6 +539,15 @@ class CausalSelfAttention(nn.Module):
         self.n_rep = config.n_head // config.n_kv_head
         self.dropout_rate = config.dropout
         self.use_rope = config.use_rope
+        self.attn_logit_cap = config.attn_logit_cap
+
+        # Sliding window: layer 0,2,4... = global, layer 1,3,5... = local
+        if config.alternating_layers and layer_id % 2 == 1:
+            self.window_size = config.sliding_window
+        elif not config.alternating_layers and config.sliding_window > 0:
+            self.window_size = config.sliding_window
+        else:
+            self.window_size = 0  # Full attention
 
         self.q_proj = nn.Linear(config.n_embd, config.n_head * self.head_dim,
                                 bias=config.bias)
@@ -484,9 +561,14 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
 
         if self.use_rope:
-            self.rotary_emb = RotaryEmbedding(self.head_dim,
-                                              max_seq_len=config.block_size)
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim,
+                max_seq_len=config.block_size,
+                scaling_type=config.rope_scaling_type,
+                scaling_factor=config.rope_scaling_factor,
+            )
 
+        # Pre-build causal mask
         self.register_buffer(
             "causal_mask",
             torch.tril(torch.ones(config.block_size, config.block_size))
@@ -500,6 +582,18 @@ class CausalSelfAttention(nn.Module):
         return x[:, :, None, :, :].expand(B, n_kv, self.n_rep, T, D).reshape(
             B, self.n_head, T, D
         )
+
+    def _make_sliding_window_mask(self, T, total_T, device):
+        """Create a sliding window causal mask."""
+        mask = torch.ones(T, total_T, device=device)
+        # Causal: can't look into future
+        for i in range(T):
+            pos = total_T - T + i  # Position in full sequence
+            mask[i, pos + 1:] = 0  # Can't see future
+            # Sliding window: can't see beyond window
+            window_start = max(0, pos - self.window_size + 1)
+            mask[i, :window_start] = 0
+        return mask.view(1, 1, T, total_T)
 
     def forward(self, x, past_kv=None):
         B, T, C = x.size()
@@ -522,7 +616,15 @@ class CausalSelfAttention(nn.Module):
         k_expanded = self._repeat_kv(k)
         v_expanded = self._repeat_kv(v)
 
-        if hasattr(F, "scaled_dot_product_attention") and past_kv is None:
+        # Decide whether to use Flash Attention (SDPA)
+        use_flash = (
+            hasattr(F, "scaled_dot_product_attention")
+            and past_kv is None
+            and self.window_size == 0
+            and self.attn_logit_cap == 0
+        )
+
+        if use_flash:
             y = F.scaled_dot_product_attention(
                 q, k_expanded, v_expanded, attn_mask=None,
                 dropout_p=self.dropout_rate if self.training else 0.0,
@@ -531,10 +633,25 @@ class CausalSelfAttention(nn.Module):
         else:
             total_len = k_expanded.shape[2]
             att = (q @ k_expanded.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+
+            # Logit soft-capping (Gemma 2)
+            if self.attn_logit_cap > 0:
+                att = att / self.attn_logit_cap
+                att = torch.tanh(att)
+                att = att * self.attn_logit_cap
+
+            # Apply mask
             if past_kv is None:
-                att = att.masked_fill(
-                    self.causal_mask[:, :, :T, :T] == 0, float("-inf")
-                )
+                if self.window_size > 0:
+                    # Sliding window mask
+                    sw_mask = self._make_sliding_window_mask(T, total_len, x.device)
+                    att = att.masked_fill(sw_mask == 0, float("-inf"))
+                else:
+                    # Standard causal mask
+                    att = att.masked_fill(
+                        self.causal_mask[:, :, :T, :T] == 0, float("-inf")
+                    )
+
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v_expanded
@@ -555,11 +672,11 @@ class TransformerBlock(nn.Module):
         self.ln_1 = RMSNorm(config.n_embd)
         self.ln_2 = RMSNorm(config.n_embd)
 
-        # Attention: MLA or GQA
+        # Attention: MLA or GQA (pass layer_id for alternating window)
         if config.use_mla:
             self.attn = MultiHeadLatentAttention(config)
         else:
-            self.attn = CausalSelfAttention(config)
+            self.attn = CausalSelfAttention(config, layer_id=layer_id)
 
         # FFN: Dense for first N layers, MoE for the rest (DeepSeek pattern)
         self.use_moe = False
@@ -612,7 +729,7 @@ class MTPModule(nn.Module):
                                          dropout=config.dropout)
         else:
             self.ffn = StandardFeedForward(config.n_embd, bias=config.bias,
-                                           dropout=config.dropout)
+                                            dropout=config.dropout)
 
     def forward(self, h, target_emb):
         """
@@ -638,15 +755,17 @@ class MTPModule(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GPT(nn.Module):
-    """GPT-4 / DeepSeek V3 Architecture Language Model.
+    """NanoForge: Frontier-Architecture Language Model.
 
-    Features: GQA or MLA attention, MoE with shared experts,
-    KV-cache, RoPE, SwiGLU, RMSNorm, Multi-Token Prediction.
+    Features: GQA or MLA attention, sliding window, Flash Attention,
+    MoE with shared experts, KV-cache, RoPE with YaRN, SwiGLU, RMSNorm,
+    Multi-Token Prediction, gradient checkpointing, advanced sampling.
     """
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
         self.aux_losses = []
+        self.gradient_checkpointing = False  # Set at training time
 
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -688,6 +807,14 @@ class GPT(nn.Module):
             features.append(f"MLA(kv_rank={config.kv_lora_rank})")
         elif config.n_kv_head < config.n_head:
             features.append(f"GQA({config.n_head}Q/{config.n_kv_head}KV)")
+        if config.sliding_window > 0:
+            sw_type = "alternating" if config.alternating_layers else "full"
+            features.append(f"SlidingWindow({config.sliding_window}, {sw_type})")
+        if config.attn_logit_cap > 0:
+            features.append(f"LogitCap({config.attn_logit_cap})")
+        if config.rope_scaling_type != "none":
+            features.append(f"RoPE-{config.rope_scaling_type.upper()}"
+                          f"({config.rope_scaling_factor}x)")
         if config.use_moe:
             active = self.get_num_params_active()
             features.append(f"MoE({config.n_experts_active}/{config.n_experts}"
@@ -730,6 +857,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory-efficient training."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+
     def forward(self, idx, targets=None):
         """
         Forward pass with optional Multi-Token Prediction.
@@ -752,9 +887,14 @@ class GPT(nn.Module):
         # Collect aux losses
         self.aux_losses = []
 
-        # Transformer blocks
+        # Transformer blocks (with optional gradient checkpointing)
         for block in self.transformer.h:
-            x, _ = block(x)
+            if self.gradient_checkpointing and self.training:
+                x, _ = torch.utils.checkpoint.checkpoint(
+                    block, x, None, use_reentrant=False
+                )
+            else:
+                x, _ = block(x)
             if block.use_moe and hasattr(block.ffn, 'aux_loss'):
                 aux = block.ffn.aux_loss
                 if aux is not None:
@@ -816,10 +956,75 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    def _apply_sampling(self, logits, temperature=1.0, top_k=None, top_p=None,
+                        min_p=None, repetition_penalty=1.0, past_tokens=None):
+        """Apply temperature, repetition penalty, and sampling filters.
+
+        Args:
+            logits: (B, vocab_size) raw logits
+            temperature: sampling temperature
+            top_k: top-k filtering
+            top_p: nucleus (top-p) sampling threshold
+            min_p: min-p dynamic sampling threshold
+            repetition_penalty: penalty for repeated tokens (>1 = less repetition)
+            past_tokens: list of previously generated token IDs for rep penalty
+        """
+        # Repetition penalty
+        if repetition_penalty != 1.0 and past_tokens is not None and len(past_tokens) > 0:
+            past_ids = torch.tensor(past_tokens, device=logits.device).unique()
+            penalty_logits = logits[:, past_ids]
+            # Reduce logits of past tokens
+            penalty_logits = torch.where(
+                penalty_logits > 0,
+                penalty_logits / repetition_penalty,
+                penalty_logits * repetition_penalty,
+            )
+            logits[:, past_ids] = penalty_logits
+
+        # Temperature
+        logits = logits / temperature
+
+        # Top-k filtering
+        if top_k is not None and top_k > 0:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float("-inf")
+
+        # Min-p filtering (adaptive threshold based on max probability)
+        if min_p is not None and min_p > 0:
+            probs = F.softmax(logits, dim=-1)
+            max_prob = probs.max(dim=-1, keepdim=True).values
+            min_threshold = min_p * max_prob
+            logits[probs < min_threshold] = float("-inf")
+
+        # Top-p (nucleus) sampling
+        if top_p is not None and 0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            # Remove tokens with cumulative probability above threshold
+            sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+            sorted_logits[sorted_mask] = float("-inf")
+            # Scatter back
+            logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+
+        return logits
+
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,
+                 top_p=None, min_p=None, repetition_penalty=1.0,
                  use_cache=True):
-        """Generate tokens with KV-cache (supports both MLA and GQA cache)."""
+        """Generate tokens with KV-cache and advanced sampling.
+
+        Args:
+            idx: (B, T) input token IDs
+            max_new_tokens: number of tokens to generate
+            temperature: sampling temperature (0 = greedy)
+            top_k: top-k filtering
+            top_p: nucleus sampling threshold (0.9 = typical)
+            min_p: min-p dynamic threshold (0.05 = recommended)
+            repetition_penalty: >1.0 penalizes repeated tokens
+            use_cache: use KV-cache for fast generation
+        """
+        past_tokens = idx[0].tolist() if repetition_penalty != 1.0 else None
         past_kvs = None
 
         if use_cache:
@@ -838,15 +1043,22 @@ class GPT(nn.Module):
                 past_kvs.append(present_kv)
 
             x = self.transformer.ln_f(x)
-            logits = self.lm_head(x[:, [-1], :])[:, -1, :] / temperature
+            logits = self.lm_head(x[:, [-1], :])[:, -1, :]
 
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
+            logits = self._apply_sampling(
+                logits, temperature, top_k, top_p, min_p,
+                repetition_penalty, past_tokens
+            )
 
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            if temperature == 0:
+                idx_next = torch.argmax(probs, dim=-1, keepdim=True)
+            else:
+                idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
+
+            if past_tokens is not None:
+                past_tokens.append(idx_next.item())
 
             # Subsequent tokens: incremental with cache
             for _ in range(max_new_tokens - 1):
@@ -865,15 +1077,25 @@ class GPT(nn.Module):
                 past_kvs = new_past_kvs
 
                 x = self.transformer.ln_f(x)
-                logits = self.lm_head(x[:, -1, :]) / temperature
+                logits = self.lm_head(x[:, -1, :]) if x.dim() == 3 else self.lm_head(x)
 
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = float("-inf")
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(0)
+
+                logits = self._apply_sampling(
+                    logits, temperature, top_k, top_p, min_p,
+                    repetition_penalty, past_tokens
+                )
 
                 probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
+                if temperature == 0:
+                    idx_next = torch.argmax(probs, dim=-1, keepdim=True)
+                else:
+                    idx_next = torch.multinomial(probs, num_samples=1)
                 idx = torch.cat((idx, idx_next), dim=1)
+
+                if past_tokens is not None:
+                    past_tokens.append(idx_next.item())
 
                 if idx.size(1) >= self.config.block_size:
                     break
@@ -883,14 +1105,131 @@ class GPT(nn.Module):
                 idx_cond = idx if idx.size(1) <= self.config.block_size \
                     else idx[:, -self.config.block_size:]
                 logits, _ = self(idx_cond)
-                logits = logits[:, -1, :] / temperature
+                logits = logits[:, -1, :]
 
+                logits = self._apply_sampling(
+                    logits, temperature, top_k, top_p, min_p,
+                    repetition_penalty, past_tokens
+                )
+
+                probs = F.softmax(logits, dim=-1)
+                if temperature == 0:
+                    idx_next = torch.argmax(probs, dim=-1, keepdim=True)
+                else:
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+
+                if past_tokens is not None:
+                    past_tokens.append(idx_next.item())
+
+        return idx
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPECULATIVE DECODING
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SpeculativeGenerator:
+    """Speculative decoding: use a small draft model to speed up inference.
+
+    The draft model generates k candidate tokens, then the main (target) model
+    verifies them all in a single forward pass. Matching tokens are accepted,
+    rejection happens at the first divergence.
+
+    Achieves 2-3x speedup when draft model has high acceptance rate.
+
+    Usage:
+        spec_gen = SpeculativeGenerator(target_model, draft_model, k=5)
+        output_ids = spec_gen.generate(input_ids, max_new_tokens=200)
+    """
+    def __init__(self, target_model: GPT, draft_model: GPT, k: int = 5):
+        self.target = target_model
+        self.draft = draft_model
+        self.k = k
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50):
+        """Generate using speculative decoding."""
+        generated = 0
+
+        while generated < max_new_tokens:
+            # Step 1: Draft model generates k candidates
+            draft_tokens = []
+            draft_probs = []
+            draft_idx = idx.clone()
+
+            for _ in range(self.k):
+                logits, _ = self.draft(
+                    draft_idx if draft_idx.size(1) <= self.draft.config.block_size
+                    else draft_idx[:, -self.draft.config.block_size:]
+                )
+                logits = logits[:, -1, :] / temperature
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = float("-inf")
-
                 probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, idx_next), dim=1)
+                token = torch.multinomial(probs, num_samples=1)
+                draft_tokens.append(token)
+                draft_probs.append(probs)
+                draft_idx = torch.cat([draft_idx, token], dim=1)
+
+            # Step 2: Target model verifies all k tokens in one pass
+            verify_idx = torch.cat([idx] + draft_tokens, dim=1)
+            verify_idx = verify_idx if verify_idx.size(1) <= self.target.config.block_size \
+                else verify_idx[:, -self.target.config.block_size:]
+
+            target_logits, _ = self.target(verify_idx)
+
+            # Step 3: Accept/reject draft tokens
+            n_accepted = 0
+            prompt_len = idx.size(1)
+
+            for i in range(self.k):
+                target_pos = prompt_len - 1 + i  # Position in the verify sequence
+                if target_pos >= target_logits.size(1):
+                    break
+
+                target_logit = target_logits[:, target_pos, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(target_logit, min(top_k, target_logit.size(-1)))
+                    target_logit[target_logit < v[:, [-1]]] = float("-inf")
+                target_prob = F.softmax(target_logit, dim=-1)
+
+                draft_token = draft_tokens[i]
+                draft_p = draft_probs[i].gather(1, draft_token)
+                target_p = target_prob.gather(1, draft_token)
+
+                # Accept with probability min(1, target_p / draft_p)
+                ratio = (target_p / (draft_p + 1e-10)).clamp(max=1.0)
+                if torch.rand(1, device=idx.device) < ratio:
+                    n_accepted += 1
+                    idx = torch.cat([idx, draft_token], dim=1)
+                    generated += 1
+                    if generated >= max_new_tokens:
+                        break
+                else:
+                    # Reject: sample from adjusted distribution
+                    adjusted = torch.clamp(target_prob - draft_probs[i], min=0)
+                    adjusted = adjusted / (adjusted.sum(dim=-1, keepdim=True) + 1e-10)
+                    correction_token = torch.multinomial(adjusted, num_samples=1)
+                    idx = torch.cat([idx, correction_token], dim=1)
+                    generated += 1
+                    break
+
+            # If all accepted, sample one more from target
+            if n_accepted == self.k and generated < max_new_tokens:
+                last_pos = prompt_len - 1 + self.k
+                if last_pos < target_logits.size(1):
+                    bonus_logit = target_logits[:, last_pos, :] / temperature
+                    if top_k is not None:
+                        v, _ = torch.topk(bonus_logit, min(top_k, bonus_logit.size(-1)))
+                        bonus_logit[bonus_logit < v[:, [-1]]] = float("-inf")
+                    bonus_prob = F.softmax(bonus_logit, dim=-1)
+                    bonus_token = torch.multinomial(bonus_prob, num_samples=1)
+                    idx = torch.cat([idx, bonus_token], dim=1)
+                    generated += 1
+
+            if idx.size(1) >= self.target.config.block_size:
+                break
 
         return idx

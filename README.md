@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">🔥 NanoForge</h1>
+  <h1 align="center">🔥 microGPT</h1>
   <p align="center"><strong>Train your own LLM from scratch — with every frontier innovation</strong></p>
   <p align="center">
     <em>GPT-4 • DeepSeek V3 • Gemma 2 • Mistral • LLaMA 3 — Zero abstraction. Pure PyTorch.</em>
@@ -18,7 +18,7 @@
 
 ---
 
-NanoForge is a **from-scratch LLM training framework** implementing every major innovation from GPT-4 through DeepSeek V3, Gemma 2, and Mistral — in readable PyTorch. Train on any text, scale from laptop to GPU cluster, fine-tune with LoRA, align with DPO, export to GGUF.
+microGPT is a **from-scratch LLM training framework** implementing every major innovation from GPT-4 through DeepSeek V3, Gemma 2, and Mistral — in readable PyTorch. Train on any text, scale from laptop to GPU cluster, fine-tune with LoRA, align with DPO, export to GGUF.
 
 ## Architecture
 
@@ -257,7 +257,7 @@ config = GPTConfig(
 ## Project Structure
 
 ```
-nanoforge/
+microGPT/
 ├── model.py            # MLA, GQA, sliding window, Flash Attn, MoE, MTP, KV-cache,
 │                       # RoPE+YaRN, SwiGLU, speculative decoding, grad checkpointing
 ├── config.py           # All hyperparameters + presets (small → gemma2)

@@ -1,5 +1,5 @@
 """
-LoRA — Low-Rank Adaptation for NanoForge
+LoRA — Low-Rank Adaptation for microGPT
 ==========================================
 Implements LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 

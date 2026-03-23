@@ -195,3 +195,203 @@ def load_lora(model, path: str, device: str = None):
 
     print(f"Loaded {loaded} LoRA layers from {path}")
     return model
+
+
+# ==============================================================================
+#  QLoRA — 4-bit Quantized LoRA
+# ==============================================================================
+
+# NormalFloat4 lookup table (16 values from the normal distribution)
+NF4_TABLE = torch.tensor([
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
+], dtype=torch.float32)
+
+
+def quantize_nf4(tensor: torch.Tensor):
+    """Quantize a tensor to 4-bit NormalFloat format.
+
+    Returns:
+        quantized: uint8 tensor (2 values packed per byte)
+        absmax: per-block absolute max for dequantization
+        shape: original tensor shape
+    """
+    flat = tensor.flatten().float()
+    block_size = 64  # quantize in blocks of 64
+
+    # Pad to multiple of block_size
+    n = flat.numel()
+    pad = (block_size - n % block_size) % block_size
+    if pad > 0:
+        flat = torch.cat([flat, torch.zeros(pad)])
+
+    n_blocks = flat.numel() // block_size
+    blocks = flat.reshape(n_blocks, block_size)
+
+    # Compute per-block absmax
+    absmax = blocks.abs().max(dim=1).values.clamp(min=1e-8)
+
+    # Normalize to [-1, 1]
+    normalized = blocks / absmax.unsqueeze(1)
+
+    # Find nearest NF4 value for each element
+    diffs = (normalized.unsqueeze(-1) - NF4_TABLE.unsqueeze(0).unsqueeze(0)).abs()
+    indices = diffs.argmin(dim=-1)  # (n_blocks, block_size)
+
+    # Pack two 4-bit values into one uint8
+    indices_flat = indices.reshape(-1)
+    n_pairs = indices_flat.numel() // 2
+    packed = (indices_flat[::2] << 4 | indices_flat[1::2]).to(torch.uint8)
+
+    return packed, absmax, tensor.shape
+
+
+def dequantize_nf4(packed: torch.Tensor, absmax: torch.Tensor,
+                    shape: torch.Size):
+    """Dequantize NF4 tensor back to float."""
+    block_size = 64
+
+    # Unpack uint8 to two 4-bit indices
+    high = (packed >> 4).to(torch.long)
+    low = (packed & 0x0F).to(torch.long)
+    indices = torch.stack([high, low], dim=-1).flatten()
+
+    # Lookup NF4 values
+    values = NF4_TABLE[indices]
+
+    # Reshape to blocks and scale
+    total = absmax.numel() * block_size
+    values = values[:total].reshape(-1, block_size)
+    values = values * absmax.unsqueeze(1)
+
+    # Flatten and trim to original size
+    flat = values.flatten()
+    n_elements = 1
+    for s in shape:
+        n_elements *= s
+    flat = flat[:n_elements]
+
+    return flat.reshape(shape)
+
+
+class NF4Linear(nn.Module):
+    """Linear layer with frozen 4-bit NF4 quantized weights.
+
+    Stores weights as packed uint8 (4-bit) and dequantizes on-the-fly
+    during forward pass. ~4x memory savings vs FP16.
+    """
+
+    def __init__(self, original: nn.Linear):
+        super().__init__()
+        # Quantize weights to NF4
+        packed, absmax, shape = quantize_nf4(original.weight.data)
+        self.register_buffer("weight_packed", packed)
+        self.register_buffer("weight_absmax", absmax)
+        self.weight_shape = shape
+
+        # Keep bias in full precision
+        if original.bias is not None:
+            self.bias = nn.Parameter(original.bias.data.clone())
+            self.bias.requires_grad = False
+        else:
+            self.bias = None
+
+        self.in_features = original.in_features
+        self.out_features = original.out_features
+
+    def forward(self, x):
+        # Dequantize on-the-fly
+        weight = dequantize_nf4(
+            self.weight_packed, self.weight_absmax, self.weight_shape
+        ).to(x.dtype).to(x.device)
+        return F.linear(x, weight, self.bias)
+
+
+class QLoRALinear(nn.Module):
+    """4-bit quantized linear layer with LoRA adapters.
+
+    Base weights are stored in NF4 (4-bit), LoRA A/B matrices are FP16/BF16.
+    This allows fine-tuning 7B+ models on consumer GPUs (8GB VRAM).
+    """
+
+    def __init__(self, original: nn.Linear, rank: int = 16, alpha: float = 32.0,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        # Quantize base weights to NF4
+        self.base = NF4Linear(original)
+
+        # LoRA adapters in full precision
+        self.lora_A = nn.Parameter(torch.zeros(original.in_features, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, original.out_features))
+
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_B)
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x):
+        # Quantized base forward
+        result = self.base(x)
+        # LoRA addition in full precision
+        lora_out = self.dropout(x) @ self.lora_A @ self.lora_B
+        return result + lora_out * self.scaling
+
+
+def apply_qlora(model, rank: int = 16, alpha: float = 32.0, dropout: float = 0.0,
+                target_modules: list = None):
+    """Apply QLoRA (4-bit quantized LoRA) to a GPT model.
+
+    Quantizes base model to 4-bit NF4, applies LoRA adapters on top.
+    ~4x memory savings vs standard LoRA.
+
+    Args:
+        model: GPT model instance
+        rank: LoRA rank
+        alpha: LoRA scaling factor
+        dropout: dropout on LoRA layers
+        target_modules: module name patterns to target
+    """
+    if target_modules is None:
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "c_proj",
+            "wq", "wq_a", "wq_b", "wkv_a", "wkv_b", "wo",
+            "w1", "w2", "w3", "c_fc",
+        ]
+
+    # Freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+
+    qlora_count = 0
+    for name, module in model.named_modules():
+        for attr_name in dir(module):
+            target = getattr(module, attr_name, None)
+            if not isinstance(target, nn.Linear):
+                continue
+            if not any(t in attr_name for t in target_modules):
+                continue
+
+            qlora_layer = QLoRALinear(target, rank=rank, alpha=alpha, dropout=dropout)
+            setattr(module, attr_name, qlora_layer)
+            qlora_count += 1
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Estimate memory savings
+    total_weight_bytes = sum(
+        p.numel() * p.element_size() for p in model.parameters()
+    )
+
+    print(f"QLoRA applied: {qlora_count} layers | rank={rank} | NF4 quantized")
+    print(f"  Trainable: {trainable_params:,} / {total_params:,} "
+          f"({trainable_params/total_params:.2%})")
+
+    return model
+

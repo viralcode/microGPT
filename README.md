@@ -45,7 +45,12 @@ superGPT is a **from-scratch LLM training framework** implementing every major i
 | 📈 **WSD LR Schedule** | Warmup-Stable-Decay for better convergence | DeepSeek V3 |
 | 📦 **GGUF Export** | Run your model in llama.cpp / Ollama | llama.cpp |
 | 🧬 **Knowledge Distillation** | Transfer knowledge from large to small model | DeepSeek R1, Qwen |
-| 🌐 **FSDP** | Multi-GPU training | PyTorch |
+| 🌐 **FSDP + 3D Parallelism** | Tensor + Pipeline + Data parallel training | Megatron-LM |
+| 🔢 **QLoRA (4-bit Training)** | Fine-tune 7B models on 8GB VRAM | QLoRA |
+| 🎮 **PPO / GRPO** | Full RLHF — PPO or DeepSeek R1-style GRPO | DeepSeek R1, OpenAI |
+| 🚀 **Inference Server** | Continuous batching + PagedAttention + OpenAI API | vLLM, TGI |
+| 📊 **Streaming Data** | Sharded datasets, HF streaming, cloud-ready | Mosaic, WebDataset |
+| 📝 **Evaluation Harness** | MMLU, HellaSwag, ARC, GSM8K, HumanEval | lm-eval-harness |
 
 ## Quick Start
 
@@ -285,6 +290,81 @@ python generate.py --checkpoint checkpoints/distilled_best.pt --interactive
 | `meta-llama/Llama-3.2-1B` | 1B | Strong baseline |
 | `mistralai/Mistral-7B-v0.3` | 7B | High quality, needs GPU |
 
+## RLHF: PPO & GRPO
+
+Align your model with reinforcement learning from human feedback:
+
+```bash
+# Train a reward model from preference data
+python rlhf.py reward --checkpoint best.pt --data preferences.jsonl
+
+# GRPO alignment (DeepSeek R1 style, no value model needed)
+python rlhf.py grpo --checkpoint best.pt --reward-model reward.pt
+
+# GRPO with rule-based rewards (no reward model needed)
+python rlhf.py grpo --checkpoint best.pt --rule-reward length
+```
+
+## QLoRA (4-bit Training)
+
+Fine-tune large models on consumer GPUs with 4-bit quantized LoRA:
+
+```python
+from lora import apply_qlora
+model = GPT(config)
+apply_qlora(model, rank=16)  # Base weights -> NF4 (4-bit), LoRA in FP16
+# Fine-tune 7B models on 8GB VRAM
+```
+
+## Inference Server
+
+Serve your model with an OpenAI-compatible API:
+
+```bash
+python serve.py --checkpoint best.pt --port 8000
+
+# Query it
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "To be or not to be", "max_tokens": 100, "stream": true}'
+```
+
+Features: continuous batching, PagedAttention, SSE streaming.
+
+## 3D Parallelism
+
+Train massive models across GPU clusters:
+
+```bash
+# 8 GPUs: 2-way tensor parallel x 4-way pipeline parallel
+torchrun --nproc_per_node=8 train.py --preset xl \
+    --tensor-parallel 2 --pipeline-parallel 4
+```
+
+## Streaming Data
+
+Train on multi-terabyte datasets without loading into memory:
+
+```bash
+# Shard a dataset
+python streaming.py shard --input data/train.bin --n-shards 64 --output data/shards/
+
+# Stream from HuggingFace
+python train.py --hf-dataset HuggingFaceFW/fineweb --streaming
+```
+
+## Evaluation Harness
+
+Benchmark your model on standard LLM evaluations:
+
+```bash
+# Run all benchmarks (MMLU, HellaSwag, ARC, GSM8K, TruthfulQA, HumanEval)
+python evaluate.py --checkpoint best.pt
+
+# Specific benchmarks with few-shot
+python evaluate.py --checkpoint best.pt --benchmarks mmlu gsm8k --n-shot 5 --output results.json
+```
+
 ## Project Structure
 
 ```
@@ -295,10 +375,15 @@ superGPT/
 ├── train.py            # Training (AdamW, cosine/WSD LR, FSDP, grad ckpt, mixed prec)
 ├── generate.py         # Generation (top-k/p, min-p, rep penalty, speculative decoding)
 ├── align.py            # DPO alignment from preference pairs
-├── distill.py          # Knowledge distillation (teacher → student)
-├── lora.py             # LoRA: apply, merge, save, load
-├── finetune.py         # LoRA fine-tuning script
+├── distill.py          # Knowledge distillation (teacher → student, HuggingFace support)
+├── lora.py             # LoRA + QLoRA (4-bit NF4 quantized training)
+├── finetune.py         # LoRA / QLoRA fine-tuning script
 ├── export.py           # GGUF export (FP16, Q8_0, Q4_0)
+├── serve.py            # HTTP inference server (continuous batching, PagedAttention)
+├── parallel.py         # 3D Parallelism (tensor + pipeline parallel)
+├── streaming.py        # Streaming data pipelines (sharded, HuggingFace, text glob)
+├── rlhf.py             # RLHF: PPO + GRPO (DeepSeek R1 style)
+├── evaluate.py         # Benchmark harness (MMLU, HellaSwag, ARC, GSM8K, HumanEval)
 ├── data/
 │   └── prepare_data.py # Tokenization (tiktoken BPE or character-level)
 └── requirements.txt
@@ -321,6 +406,11 @@ superGPT/
 - [LoRA](https://arxiv.org/abs/2106.09685) — Low-rank adaptation
 - [DPO](https://arxiv.org/abs/2305.18290) — Direct Preference Optimization
 - [Speculative Decoding](https://arxiv.org/abs/2302.01318) — Draft-verify acceleration
+- [QLoRA](https://arxiv.org/abs/2305.14314) — 4-bit quantized fine-tuning
+- [PPO](https://arxiv.org/abs/1707.06347) — Proximal Policy Optimization
+- [GRPO](https://arxiv.org/abs/2402.03300) — Group Relative Policy Optimization (DeepSeek R1)
+- [PagedAttention](https://arxiv.org/abs/2309.06180) — Efficient KV-cache management
+- [Megatron-LM](https://arxiv.org/abs/1909.08053) — 3D parallelism
 - [nanoGPT](https://github.com/karpathy/nanoGPT) — Inspiration
 
 ## License

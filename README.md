@@ -424,8 +424,10 @@ superGPT/
 📚 **In-depth guides for training frontier LLMs:**
 
 | Tutorial | Description |
-|----------|------------|
-| [**Training Data Guide**](tutorials/training-data-guide.md) | Complete guide to preparing training data — from crawling the web to tokenization, data mixing, and training at scale. Covers code, math, and general data pipelines with real code examples. Based on Llama 3 and DeepSeek-V3 technical reports. |
+|----------|-------------|
+| [**Getting Started**](tutorials/getting-started.md) | Complete guide to superGPT — installation, architecture, all model presets, data preparation, training, text generation, LoRA fine-tuning, distillation, multi-GPU FSDP, and troubleshooting. |
+| [**Training Data Guide**](tutorials/training-data-guide.md) | How to prepare training data from scratch — web crawling, text extraction, quality filtering, deduplication, cleaning, custom data from GitHub/Google/PDFs, synthetic data generation (Magpie, Evol-Instruct), tokenization, data mixing, and curriculum learning. |
+| [**Deploy on RunPod**](tutorials/deploy-runpod.md) | Step-by-step guide to renting cloud GPUs on RunPod and training superGPT models — GPU selection, SSH setup, background training, monitoring, downloading checkpoints, multi-GPU, and cost optimization. |
 
 ## License
 

@@ -13,7 +13,8 @@
   <a href="#generation">Generation</a> •
   <a href="#lora-fine-tuning">LoRA</a> •
   <a href="#alignment">Alignment</a> •
-  <a href="#export">Export</a>
+  <a href="#export">Export</a> •
+  <a href="#tutorials">Tutorials</a>
 </p>
 
 ---
@@ -417,6 +418,14 @@ superGPT/
 - [PagedAttention](https://arxiv.org/abs/2309.06180) — Efficient KV-cache management
 - [Megatron-LM](https://arxiv.org/abs/1909.08053) — 3D parallelism
 - [nanoGPT](https://github.com/karpathy/nanoGPT) — Inspiration
+
+## Tutorials
+
+📚 **In-depth guides for training frontier LLMs:**
+
+| Tutorial | Description |
+|----------|------------|
+| [**Training Data Guide**](tutorials/training-data-guide.md) | Complete guide to preparing training data — from crawling the web to tokenization, data mixing, and training at scale. Covers code, math, and general data pipelines with real code examples. Based on Llama 3 and DeepSeek-V3 technical reports. |
 
 ## License
 

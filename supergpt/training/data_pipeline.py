@@ -1,38 +1,26 @@
 """
-Production Streaming Data Pipeline for superGPT
-=================================================
-Stream large datasets from HuggingFace directly to GPU without loading
-everything into RAM. Supports:
+Production Data Pipeline for superGPT
+========================================
+Tokenize large datasets and write fixed-size shard files to disk.
+Uses multiprocessing for fast tokenization and pre-allocated numpy
+buffers for constant memory usage — never accumulates tokens in RAM.
 
-  - Streaming tokenization from HF datasets (petabyte-scale)
-  - Data quality filtering (length, repetition, language)
-  - MinHash approximate deduplication
-  - Distributed-aware sharding across FSDP ranks
-  - Multi-worker prefetching for maximum GPU utilization
+Based on Karpathy's llm.c fineweb.py pattern (the proven approach).
 
-Usage:
-    # In train.py — replace load_data with streaming pipeline:
+Two modes:
+  1. Standalone prep: tokenize dataset → shard files on disk
+  2. Streaming: iterate through HF dataset on-the-fly during training
+
+Usage (standalone — prepare data first, train many times):
+    python -m supergpt.training.data_pipeline \
+        --dataset HuggingFaceFW/fineweb-edu \
+        --tokenizer Qwen/Qwen2.5-0.5B \
+        --output-dir data \
+        --max-tokens 100000000
+
+Usage (in training script — stream on-the-fly):
     from supergpt.training.data_pipeline import create_streaming_dataloader
-
-    dataloader = create_streaming_dataloader(
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        tokenizer_name="Qwen/Qwen2.5-0.5B",
-        block_size=256,
-        batch_size=16,
-        num_workers=4,
-    )
-
-    for batch in dataloader:
-        x, y = batch["input_ids"], batch["labels"]
-        ...
-
-    # Standalone data preparation with quality filtering:
-    python -m supergpt.training.data_pipeline \\
-        --dataset HuggingFaceFW/fineweb-edu \\
-        --tokenizer Qwen/Qwen2.5-0.5B \\
-        --output-dir data \\
-        --max-tokens 1000000000 \\
-        --quality-filter
+    loader = create_streaming_dataloader("HuggingFaceFW/fineweb-edu", ...)
 """
 
 import os
@@ -42,6 +30,7 @@ import time
 import hashlib
 import argparse
 import pickle
+import glob
 from typing import Optional, List, Iterator, Callable
 from collections import defaultdict
 
@@ -51,255 +40,218 @@ from torch.utils.data import IterableDataset, DataLoader
 
 
 # =============================================================================
-#  Data Quality Filter
+#  Standalone Data Preparation (Karpathy's shard pattern)
 # =============================================================================
 
-class DataQualityFilter:
-    """Filter low-quality text samples before tokenization.
+def tokenize_doc(doc):
+    """Tokenize a single document. Used by multiprocessing Pool.
 
-    Applies a cascade of fast heuristic filters:
-    1. Length filter — skip too-short or too-long texts
-    2. Repetition filter — skip text with excessive n-gram repetition
-    3. Language filter — basic ASCII ratio check (English proxy)
-    4. Special character filter — skip text with too many special chars
+    Returns a numpy array of uint32 tokens.
+    Global tokenizer is initialized per-worker via pool initializer.
     """
+    text = doc.get("text", "")
+    if not text or len(text.strip()) < 50:
+        return np.array([], dtype=np.uint32)
 
-    def __init__(
-        self,
-        min_chars: int = 50,
-        max_chars: int = 100_000,
-        min_words: int = 10,
-        max_repetition_ratio: float = 0.3,
-        min_ascii_ratio: float = 0.9,
-        max_special_ratio: float = 0.1,
-        enabled: bool = True,
-    ):
-        self.min_chars = min_chars
-        self.max_chars = max_chars
-        self.min_words = min_words
-        self.max_repetition_ratio = max_repetition_ratio
-        self.min_ascii_ratio = min_ascii_ratio
-        self.max_special_ratio = max_special_ratio
-        self.enabled = enabled
+    tokens = _worker_tokenizer.encode(text, add_special_tokens=False)
+    # Filter token 0 (padding artifact in some tokenizers)
+    tokens = [t for t in tokens if t != 0]
+    if not tokens:
+        return np.array([], dtype=np.uint32)
 
-        # Stats
-        self.total = 0
-        self.passed = 0
-        self.filtered_reasons = defaultdict(int)
-
-    def __call__(self, text: str) -> bool:
-        """Return True if text passes all quality checks."""
-        if not self.enabled:
-            return True
-
-        self.total += 1
-
-        if not text or not text.strip():
-            self.filtered_reasons["empty"] += 1
-            return False
-
-        text = text.strip()
-
-        # Length filter
-        if len(text) < self.min_chars:
-            self.filtered_reasons["too_short"] += 1
-            return False
-        if len(text) > self.max_chars:
-            self.filtered_reasons["too_long"] += 1
-            return False
-
-        # Word count
-        words = text.split()
-        if len(words) < self.min_words:
-            self.filtered_reasons["too_few_words"] += 1
-            return False
-
-        # ASCII ratio (English proxy)
-        ascii_chars = sum(1 for c in text if ord(c) < 128)
-        ascii_ratio = ascii_chars / len(text)
-        if ascii_ratio < self.min_ascii_ratio:
-            self.filtered_reasons["non_english"] += 1
-            return False
-
-        # Special character ratio
-        special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
-        special_ratio = special_chars / len(text)
-        if special_ratio > self.max_special_ratio:
-            self.filtered_reasons["too_many_specials"] += 1
-            return False
-
-        # Repetition filter (check 2-gram repetition)
-        if len(words) >= 20:
-            bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
-            unique_bigrams = len(set(bigrams))
-            total_bigrams = len(bigrams)
-            repetition = 1.0 - (unique_bigrams / total_bigrams)
-            if repetition > self.max_repetition_ratio:
-                self.filtered_reasons["too_repetitive"] += 1
-                return False
-
-        self.passed += 1
-        return True
-
-    def stats(self) -> dict:
-        """Return filtering statistics."""
-        return {
-            "total": self.total,
-            "passed": self.passed,
-            "pass_rate": self.passed / max(self.total, 1),
-            "filtered_reasons": dict(self.filtered_reasons),
-        }
-
-    def print_stats(self):
-        """Print filtering statistics."""
-        s = self.stats()
-        print(f"\n  Quality Filter Stats:")
-        print(f"    Total:     {s['total']:,}")
-        print(f"    Passed:    {s['passed']:,} ({s['pass_rate']:.1%})")
-        for reason, count in sorted(s["filtered_reasons"].items(), key=lambda x: -x[1]):
-            print(f"    Filtered ({reason}): {count:,}")
+    tokens_np = np.array(tokens, dtype=np.uint32)
+    return tokens_np
 
 
-# =============================================================================
-#  MinHash Deduplicator
-# =============================================================================
+def _init_worker(tokenizer_name):
+    """Initialize tokenizer in each worker process (called once per worker)."""
+    global _worker_tokenizer
+    from transformers import AutoTokenizer
+    _worker_tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, trust_remote_code=True
+    )
 
-class MinHashDeduplicator:
-    """Approximate deduplication using MinHash signatures.
 
-    Uses locality-sensitive hashing to detect near-duplicate documents.
-    Much faster than exact dedup for large datasets.
+def prepare_data(
+    dataset_name: str = "HuggingFaceFW/fineweb-edu",
+    subset: Optional[str] = "sample-10BT",
+    tokenizer_name: str = "Qwen/Qwen2.5-0.5B",
+    output_dir: str = "data",
+    max_tokens: int = 100_000_000,
+    shard_size: int = 10_000_000,  # 10M tokens per shard (~40MB on disk)
+    text_field: str = "text",
+    num_workers: int = 0,  # 0 = auto
+):
+    """Prepare tokenized shard files from a HuggingFace dataset.
 
-    Algorithm:
-    1. Compute shingle set (character n-grams) for each document
-    2. Generate MinHash signature (K independent hash functions)
-    3. Use LSH bands to find candidate duplicates
-    4. Documents with Jaccard similarity > threshold are duplicates
+    Memory-safe: uses a pre-allocated numpy buffer of shard_size tokens.
+    When the buffer fills, write it to disk and reset. Peak RAM usage
+    is ~shard_size * 4 bytes (40MB for 10M tokens) regardless of dataset size.
+
+    Output structure:
+        data/
+          val_000000.bin    (first shard = validation)
+          train_000001.bin  (rest = training)
+          train_000002.bin
+          ...
+          meta.pkl          (tokenizer info, token counts)
     """
+    import multiprocessing as mp
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
 
-    def __init__(
-        self,
-        num_hashes: int = 128,
-        shingle_size: int = 5,
-        threshold: float = 0.8,
-        num_bands: int = 16,
-        enabled: bool = True,
-    ):
-        self.num_hashes = num_hashes
-        self.shingle_size = shingle_size
-        self.threshold = threshold
-        self.num_bands = num_bands
-        self.rows_per_band = num_hashes // num_bands
-        self.enabled = enabled
+    os.makedirs(output_dir, exist_ok=True)
 
-        # LSH buckets: band_idx -> {bucket_hash -> set of doc_ids}
-        self.buckets = [defaultdict(set) for _ in range(num_bands)]
-        self.seen_count = 0
-        self.dedup_count = 0
+    # Get vocab size
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    vocab_size = tokenizer.vocab_size
+    del tokenizer  # Free memory before spawning workers
 
-        # Random hash coefficients (a*x + b mod p)
-        self._prime = 2**31 - 1
-        self._a = np.random.randint(1, self._prime, size=num_hashes, dtype=np.int64)
-        self._b = np.random.randint(0, self._prime, size=num_hashes, dtype=np.int64)
+    print(f"{'='*60}")
+    print(f"  superGPT Data Pipeline")
+    print(f"  Dataset: {dataset_name}")
+    print(f"  Tokenizer: {tokenizer_name} (vocab={vocab_size:,})")
+    print(f"  Target: {max_tokens:,} tokens")
+    print(f"  Shard size: {shard_size:,} tokens ({shard_size * 4 / 1e6:.0f}MB each)")
+    print(f"{'='*60}")
 
-    def _get_shingles(self, text: str) -> set:
-        """Extract character n-gram shingles."""
-        text = text.lower().strip()
-        if len(text) < self.shingle_size:
-            return {text}
-        return {text[i:i + self.shingle_size] for i in range(len(text) - self.shingle_size + 1)}
+    # Load dataset (streaming for large datasets)
+    print(f"\nLoading dataset...")
+    kwargs = {"split": "train"}
+    if max_tokens > 500_000_000:
+        kwargs["streaming"] = True
+        print("  Mode: streaming (large dataset)")
+    else:
+        print("  Mode: download + cache")
 
-    def _minhash(self, shingles: set) -> np.ndarray:
-        """Compute MinHash signature for a shingle set."""
-        sig = np.full(self.num_hashes, np.iinfo(np.int64).max, dtype=np.int64)
+    if subset:
+        ds = load_dataset(dataset_name, subset, **kwargs)
+    else:
+        ds = load_dataset(dataset_name, **kwargs)
 
-        for shingle in shingles:
-            h = int(hashlib.md5(shingle.encode()).hexdigest(), 16) % self._prime
-            hashes = (self._a * h + self._b) % self._prime
-            sig = np.minimum(sig, hashes)
+    # Setup multiprocessing
+    if num_workers == 0:
+        num_workers = max(1, os.cpu_count() - 2)
+    print(f"  Workers: {num_workers}")
 
-        return sig
+    # Pre-allocate shard buffer (constant memory!)
+    shard_buffer = np.empty((shard_size,), dtype=np.uint32)
+    token_count = 0
+    shard_index = 0
+    total_tokens = 0
+    t0 = time.time()
 
-    def is_duplicate(self, text: str) -> bool:
-        """Check if text is a near-duplicate of previously seen text.
+    print(f"\nTokenizing...")
 
-        Also registers the text for future dedup checks.
-        Returns True if duplicate (should be skipped).
+    # Use multiprocessing for parallel tokenization
+    with mp.Pool(num_workers, initializer=_init_worker, initargs=(tokenizer_name,)) as pool:
+        for tokens in pool.imap(tokenize_doc, ds, chunksize=16):
+            if len(tokens) == 0:
+                continue
 
-        Memory safety: flushes buckets every 100K docs to cap RAM usage.
-        """
-        if not self.enabled:
-            return False
+            # Will these tokens fit in the current shard?
+            if token_count + len(tokens) < shard_size:
+                # Append to current shard buffer
+                shard_buffer[token_count:token_count + len(tokens)] = tokens
+                token_count += len(tokens)
+            else:
+                # Fill current shard, write to disk, start new one
+                remainder = shard_size - token_count
+                shard_buffer[token_count:token_count + remainder] = tokens[:remainder]
 
-        shingles = self._get_shingles(text)
-        if not shingles:
-            return False
+                # First shard = validation, rest = training
+                split = "val" if shard_index == 0 else "train"
+                filename = os.path.join(output_dir, f"{split}_{shard_index:06d}.bin")
+                shard_buffer.tofile(filename)
 
-        sig = self._minhash(shingles)
-        doc_id = self.seen_count
-        self.seen_count += 1
+                elapsed = time.time() - t0
+                total_tokens += shard_size
+                tps = total_tokens / elapsed
+                print(f"  Shard {shard_index:>3d} | {split:>5s} | "
+                      f"{total_tokens:>12,} tokens | {tps:,.0f} tok/s | "
+                      f"{os.path.getsize(filename) / 1e6:.1f}MB")
 
-        # Check LSH bands for candidate matches
-        is_dup = False
-        for band_idx in range(self.num_bands):
-            start = band_idx * self.rows_per_band
-            end = start + self.rows_per_band
-            band_hash = hashlib.md5(sig[start:end].tobytes()).hexdigest()
+                shard_index += 1
 
-            if self.buckets[band_idx][band_hash]:
-                is_dup = True
+                # Start new shard with leftover tokens
+                leftover = len(tokens) - remainder
+                shard_buffer[:leftover] = tokens[remainder:]
+                token_count = leftover
 
-            self.buckets[band_idx][band_hash].add(doc_id)
+            # Check token limit
+            if total_tokens + token_count >= max_tokens:
+                print(f"  Reached target: {max_tokens:,} tokens")
+                break
 
-        if is_dup:
-            self.dedup_count += 1
+    # Write final partial shard
+    if token_count > 0:
+        split = "val" if shard_index == 0 else "train"
+        filename = os.path.join(output_dir, f"{split}_{shard_index:06d}.bin")
+        shard_buffer[:token_count].tofile(filename)
+        total_tokens += token_count
+        print(f"  Shard {shard_index:>3d} | {split:>5s} | "
+              f"{total_tokens:>12,} tokens (final)")
 
-        # Memory safety: flush old buckets to cap RAM at ~100K docs
-        if self.seen_count % 100_000 == 0:
-            self._flush_old_buckets()
+    # Also create single train.bin and val.bin for backwards compat
+    _merge_shards(output_dir)
 
-        return is_dup
+    # Save metadata
+    meta = {
+        "tokenizer_type": "huggingface",
+        "tokenizer_name": tokenizer_name,
+        "vocab_size": vocab_size,
+        "dataset": dataset_name,
+        "subset": subset,
+        "total_tokens": total_tokens,
+        "shard_size": shard_size,
+        "num_shards": shard_index + 1,
+    }
+    with open(os.path.join(output_dir, "meta.pkl"), "wb") as f:
+        pickle.dump(meta, f)
 
-    def _flush_old_buckets(self):
-        """Clear LSH buckets to bound memory usage.
+    elapsed = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"  Done! {total_tokens:,} tokens in {shard_index + 1} shards")
+    print(f"  Time: {elapsed:.0f}s ({total_tokens/elapsed:,.0f} tok/s)")
+    print(f"  Output: {output_dir}/")
+    print(f"{'='*60}")
 
-        This trades dedup precision for memory safety — duplicates
-        more than 100K docs apart won't be caught, but that's fine
-        for streaming datasets where nearby duplicates matter most.
-        """
-        for band_idx in range(self.num_bands):
-            self.buckets[band_idx].clear()
 
-    def stats(self) -> dict:
-        return {
-            "seen": self.seen_count,
-            "duplicates": self.dedup_count,
-            "dedup_rate": self.dedup_count / max(self.seen_count, 1),
-        }
+def _merge_shards(output_dir: str):
+    """Merge shard files into single train.bin / val.bin for compatibility.
 
-    def print_stats(self):
-        s = self.stats()
-        print(f"\n  Deduplication Stats:")
-        print(f"    Documents seen:  {s['seen']:,}")
-        print(f"    Duplicates:      {s['duplicates']:,} ({s['dedup_rate']:.1%})")
+    Uses chunked reads/writes to avoid RAM spike.
+    """
+    CHUNK = 5_000_000  # Read/write 5M tokens at a time (~20MB)
+
+    for split in ["train", "val"]:
+        shard_files = sorted(glob.glob(os.path.join(output_dir, f"{split}_*.bin")))
+        if not shard_files:
+            continue
+
+        out_path = os.path.join(output_dir, f"{split}.bin")
+        with open(out_path, "wb") as out_f:
+            for shard_file in shard_files:
+                data = np.fromfile(shard_file, dtype=np.uint32)
+                # Write in chunks
+                for i in range(0, len(data), CHUNK):
+                    data[i:i + CHUNK].tofile(out_f)
+                del data
+
+        total_size = os.path.getsize(out_path)
+        print(f"  Merged {split}.bin: {total_size / 1e6:.1f}MB "
+              f"({total_size // 4:,} tokens)")
 
 
 # =============================================================================
-#  Streaming Dataset
+#  Streaming Dataset (for on-the-fly training without disk prep)
 # =============================================================================
 
 class StreamingDataset(IterableDataset):
     """Stream tokenized sequences from HuggingFace datasets.
 
-    Handles:
-    - On-the-fly tokenization from HF streaming datasets
-    - Quality filtering and deduplication
-    - Sequence packing (concatenate texts, split into fixed-length chunks)
-    - Distributed-aware sharding across workers and ranks
-    - Token ID 0 filtering (padding/special token artifact)
-
-    This is the core primitive for training on petabyte-scale data
-    without loading everything into RAM.
+    For when you want to train directly from HF without disk prep.
+    Uses constant memory — no accumulation.
     """
 
     def __init__(
@@ -308,8 +260,6 @@ class StreamingDataset(IterableDataset):
         subset: Optional[str] = None,
         tokenizer_name: str = "Qwen/Qwen2.5-0.5B",
         block_size: int = 256,
-        quality_filter: Optional[DataQualityFilter] = None,
-        deduplicator: Optional[MinHashDeduplicator] = None,
         text_field: str = "text",
         split: str = "train",
         max_tokens: Optional[int] = None,
@@ -322,8 +272,6 @@ class StreamingDataset(IterableDataset):
         self.subset = subset
         self.tokenizer_name = tokenizer_name
         self.block_size = block_size
-        self.quality_filter = quality_filter or DataQualityFilter(enabled=False)
-        self.deduplicator = deduplicator or MinHashDeduplicator(enabled=False)
         self.text_field = text_field
         self.split = split
         self.max_tokens = max_tokens
@@ -336,23 +284,21 @@ class StreamingDataset(IterableDataset):
         from datasets import load_dataset
         from transformers import AutoTokenizer
 
-        # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             self.tokenizer_name, trust_remote_code=True
         )
 
-        # Load streaming dataset
         kwargs = {"streaming": True, "split": self.split}
         if self.subset:
             ds = load_dataset(self.dataset_name, self.subset, **kwargs)
         else:
             ds = load_dataset(self.dataset_name, **kwargs)
 
-        # Distributed sharding — each rank processes different samples
+        # Distributed sharding
         if self.world_size > 1:
             ds = ds.shard(num_shards=self.world_size, index=self.rank)
 
-        # Multi-worker sharding within a single rank
+        # Multi-worker sharding
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             ds = ds.shard(
@@ -360,46 +306,47 @@ class StreamingDataset(IterableDataset):
                 index=worker_info.id,
             )
 
-        # Shuffle with seed for reproducibility
         ds = ds.shuffle(seed=self.seed, buffer_size=10_000)
 
-        # Token buffer for sequence packing
-        token_buffer = []
+        # Fixed-size token buffer for sequence packing (constant memory)
+        token_buffer = np.empty(self.block_size * 10, dtype=np.int64)
+        buf_len = 0
         total_tokens = 0
 
         for sample in ds:
             text = sample.get(self.text_field, "")
-
-            # Quality filter
-            if not self.quality_filter(text):
+            if not text or len(text.strip()) < 50:
                 continue
 
-            # Deduplication
-            if self.deduplicator.is_duplicate(text):
-                continue
-
-            # Tokenize
             ids = tokenizer.encode(text, add_special_tokens=False)
-            # Filter out token 0 (padding artifact)
             ids = [t for t in ids if t != 0]
-
             if not ids:
                 continue
 
-            token_buffer.extend(ids)
+            # Add to buffer (resize if needed)
+            needed = buf_len + len(ids)
+            if needed > len(token_buffer):
+                new_buf = np.empty(max(needed * 2, len(token_buffer) * 2), dtype=np.int64)
+                new_buf[:buf_len] = token_buffer[:buf_len]
+                token_buffer = new_buf
+
+            token_buffer[buf_len:buf_len + len(ids)] = ids
+            buf_len += len(ids)
             total_tokens += len(ids)
 
-            # Yield packed sequences when buffer has enough tokens
-            while len(token_buffer) >= self.block_size + 1:
-                chunk = token_buffer[:self.block_size + 1]
-                token_buffer = token_buffer[self.block_size:]
+            # Yield packed sequences
+            while buf_len >= self.block_size + 1:
+                chunk = token_buffer[:self.block_size + 1].copy()
+                # Shift buffer
+                remaining = buf_len - self.block_size
+                token_buffer[:remaining] = token_buffer[self.block_size:buf_len]
+                buf_len = remaining
 
-                input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
-                labels = torch.tensor(chunk[1:], dtype=torch.long)
+                yield {
+                    "input_ids": torch.from_numpy(chunk[:-1]),
+                    "labels": torch.from_numpy(chunk[1:]),
+                }
 
-                yield {"input_ids": input_ids, "labels": labels}
-
-            # Check token limit
             if self.max_tokens and total_tokens >= self.max_tokens:
                 break
 
@@ -415,8 +362,6 @@ def create_streaming_dataloader(
     block_size: int = 256,
     batch_size: int = 16,
     num_workers: int = 2,
-    quality_filter: bool = True,
-    deduplication: bool = True,
     text_field: str = "text",
     split: str = "train",
     max_tokens: Optional[int] = None,
@@ -424,39 +369,14 @@ def create_streaming_dataloader(
     world_size: int = 1,
     seed: int = 42,
     pin_memory: bool = True,
+    **kwargs,
 ) -> DataLoader:
-    """Create a production streaming dataloader for training.
-
-    Args:
-        dataset_name: HuggingFace dataset (e.g. "HuggingFaceFW/fineweb-edu")
-        tokenizer_name: HuggingFace tokenizer
-        subset: Dataset subset/config
-        block_size: Sequence length
-        batch_size: Batch size
-        num_workers: DataLoader workers for prefetching
-        quality_filter: Enable quality filtering
-        deduplication: Enable MinHash deduplication
-        text_field: Name of the text column in the dataset
-        split: Dataset split ("train", "validation")
-        max_tokens: Maximum tokens to process (None = unlimited)
-        rank: FSDP rank (for distributed sharding)
-        world_size: Total FSDP world size
-        seed: Random seed
-        pin_memory: Pin memory for faster GPU transfer
-
-    Returns:
-        DataLoader yielding batches of {"input_ids": (B, T), "labels": (B, T)}
-    """
-    qf = DataQualityFilter(enabled=quality_filter)
-    dedup = MinHashDeduplicator(enabled=deduplication)
-
+    """Create a streaming dataloader for on-the-fly training."""
     dataset = StreamingDataset(
         dataset_name=dataset_name,
         subset=subset,
         tokenizer_name=tokenizer_name,
         block_size=block_size,
-        quality_filter=qf,
-        deduplicator=dedup,
         text_field=text_field,
         split=split,
         max_tokens=max_tokens,
@@ -465,7 +385,7 @@ def create_streaming_dataloader(
         seed=seed,
     )
 
-    dataloader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -474,163 +394,6 @@ def create_streaming_dataloader(
         prefetch_factor=2 if num_workers > 0 else None,
     )
 
-    return dataloader
-
-
-# =============================================================================
-#  Standalone Data Preparation (with streaming + filtering)
-# =============================================================================
-
-def prepare_filtered_data(
-    dataset_name: str = "HuggingFaceFW/fineweb-edu",
-    subset: Optional[str] = "sample-10BT",
-    tokenizer_name: str = "Qwen/Qwen2.5-0.5B",
-    output_dir: str = "data",
-    max_tokens: int = 500_000_000,
-    quality_filter: bool = True,
-    deduplication: bool = True,
-    val_fraction: float = 0.02,
-    text_field: str = "text",
-):
-    """Prepare a high-quality training dataset with filtering and dedup.
-
-    This is the "prepare once, train many times" approach for when you
-    want to save tokenized data to disk rather than stream on-the-fly.
-    """
-    from transformers import AutoTokenizer
-    from datasets import load_dataset
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load tokenizer
-    print(f"Loading tokenizer: {tokenizer_name}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
-    vocab_size = tokenizer.vocab_size
-    print(f"  Vocab size: {vocab_size:,}")
-
-    # Setup filters
-    qf = DataQualityFilter(enabled=quality_filter)
-    dedup = MinHashDeduplicator(enabled=deduplication)
-
-    # Stream dataset
-    print(f"\nStreaming dataset: {dataset_name}")
-    kwargs = {"streaming": True, "split": "train"}
-    if subset:
-        ds = load_dataset(dataset_name, subset, **kwargs)
-    else:
-        ds = load_dataset(dataset_name, **kwargs)
-
-    # Tokenize with filtering — CHUNKED WRITES to avoid OOM
-    # Instead of accumulating all tokens in a Python list (which uses ~28 bytes
-    # per int = 28GB for 1B tokens), we write to disk in chunks of 10M tokens.
-    print("Tokenizing with quality filtering...")
-    CHUNK_SIZE = 10_000_000  # Write every 10M tokens
-    chunk_buffer = []
-    total_tokens = 0
-    t0 = time.time()
-
-    # Temporary file for streaming writes
-    tmp_path = os.path.join(output_dir, "tokens_tmp.bin")
-    tmp_file = open(tmp_path, "wb")
-
-    for i, sample in enumerate(ds):
-        text = sample.get(text_field, "")
-
-        # Quality filter
-        if not qf(text):
-            continue
-
-        # Dedup
-        if dedup.is_duplicate(text):
-            continue
-
-        # Tokenize
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        ids = [t for t in ids if t != 0]  # Filter padding token
-
-        if not ids:
-            continue
-
-        chunk_buffer.extend(ids)
-        total_tokens += len(ids)
-
-        # Flush chunk to disk when buffer is large enough
-        if len(chunk_buffer) >= CHUNK_SIZE:
-            arr = np.array(chunk_buffer, dtype=np.uint32)
-            arr.tofile(tmp_file)
-            chunk_buffer = []
-
-        if (i + 1) % 10000 == 0:
-            elapsed = time.time() - t0
-            tps = total_tokens / elapsed
-            print(f"    {i+1:,} samples | {total_tokens:,} tokens | {tps:,.0f} tok/s")
-
-        if total_tokens >= max_tokens:
-            print(f"  Reached token limit: {max_tokens:,}")
-            break
-
-    # Flush remaining tokens
-    if chunk_buffer:
-        arr = np.array(chunk_buffer, dtype=np.uint32)
-        arr.tofile(tmp_file)
-        chunk_buffer = []
-
-    tmp_file.close()
-
-    # Print filter stats
-    qf.print_stats()
-    dedup.print_stats()
-
-    # Split train/val using memory-mapped file (no RAM spike)
-    print(f"\n  Total tokens: {total_tokens:,}")
-    all_tokens = np.memmap(tmp_path, dtype=np.uint32, mode='r')
-    split_idx = int(len(all_tokens) * (1 - val_fraction))
-
-    print(f"  Train tokens: {split_idx:,}")
-    print(f"  Val tokens:   {len(all_tokens) - split_idx:,}")
-
-    # Save train/val splits
-    train_path = os.path.join(output_dir, "train.bin")
-    val_path = os.path.join(output_dir, "val.bin")
-    meta_path = os.path.join(output_dir, "meta.pkl")
-
-    # Chunked file copy to avoid loading entire array into RAM
-    COPY_CHUNK = 5_000_000  # Copy 5M tokens at a time (~20MB)
-
-    with open(train_path, "wb") as f:
-        for start in range(0, split_idx, COPY_CHUNK):
-            end = min(start + COPY_CHUNK, split_idx)
-            np.array(all_tokens[start:end], dtype=np.uint32).tofile(f)
-
-    with open(val_path, "wb") as f:
-        for start in range(split_idx, len(all_tokens), COPY_CHUNK):
-            end = min(start + COPY_CHUNK, len(all_tokens))
-            np.array(all_tokens[start:end], dtype=np.uint32).tofile(f)
-
-    # Cleanup temp file
-    del all_tokens
-    os.remove(tmp_path)
-
-    meta = {
-        "tokenizer_type": "huggingface",
-        "tokenizer_name": tokenizer_name,
-        "vocab_size": vocab_size,
-        "dataset": dataset_name,
-        "subset": subset,
-        "quality_filtered": quality_filter,
-        "deduplicated": deduplication,
-        "total_tokens": total_tokens,
-        "filter_stats": qf.stats(),
-        "dedup_stats": dedup.stats(),
-    }
-    with open(meta_path, "wb") as f:
-        pickle.dump(meta, f)
-
-    print(f"\nSaved:")
-    print(f"  Train: {train_path} ({os.path.getsize(train_path) / 1e9:.2f} GB)")
-    print(f"  Val:   {val_path} ({os.path.getsize(val_path) / 1e6:.2f} MB)")
-    print(f"  Meta:  {meta_path}")
-
 
 # =============================================================================
 #  CLI
@@ -638,7 +401,7 @@ def prepare_filtered_data(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Production data pipeline with quality filtering & dedup"
+        description="Tokenize dataset into shard files (Karpathy-style)"
     )
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu",
                         help="HuggingFace dataset name")
@@ -647,27 +410,24 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", type=str, default="Qwen/Qwen2.5-0.5B",
                         help="HuggingFace tokenizer")
     parser.add_argument("--output-dir", type=str, default="data",
-                        help="Output directory for tokenized data")
-    parser.add_argument("--max-tokens", type=int, default=500_000_000,
+                        help="Output directory for shard files")
+    parser.add_argument("--max-tokens", type=int, default=100_000_000,
                         help="Maximum tokens to process")
-    parser.add_argument("--no-quality-filter", action="store_true",
-                        help="Disable quality filtering")
-    parser.add_argument("--no-dedup", action="store_true",
-                        help="Disable deduplication")
-    parser.add_argument("--val-fraction", type=float, default=0.02,
-                        help="Validation fraction")
+    parser.add_argument("--shard-size", type=int, default=10_000_000,
+                        help="Tokens per shard file (default: 10M = ~40MB)")
     parser.add_argument("--text-field", type=str, default="text",
                         help="Name of text column in dataset")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="Tokenization workers (0 = auto)")
 
     args = parser.parse_args()
-    prepare_filtered_data(
+    prepare_data(
         dataset_name=args.dataset,
         subset=args.subset,
         tokenizer_name=args.tokenizer,
         output_dir=args.output_dir,
         max_tokens=args.max_tokens,
-        quality_filter=not args.no_quality_filter,
-        deduplication=not args.no_dedup,
-        val_fraction=args.val_fraction,
+        shard_size=args.shard_size,
         text_field=args.text_field,
+        num_workers=args.num_workers,
     )

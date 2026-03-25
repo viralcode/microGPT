@@ -225,6 +225,8 @@ class MinHashDeduplicator:
 
         Also registers the text for future dedup checks.
         Returns True if duplicate (should be skipped).
+
+        Memory safety: flushes buckets every 100K docs to cap RAM usage.
         """
         if not self.enabled:
             return False
@@ -252,7 +254,21 @@ class MinHashDeduplicator:
         if is_dup:
             self.dedup_count += 1
 
+        # Memory safety: flush old buckets to cap RAM at ~100K docs
+        if self.seen_count % 100_000 == 0:
+            self._flush_old_buckets()
+
         return is_dup
+
+    def _flush_old_buckets(self):
+        """Clear LSH buckets to bound memory usage.
+
+        This trades dedup precision for memory safety — duplicates
+        more than 100K docs apart won't be caught, but that's fine
+        for streaming datasets where nearby duplicates matter most.
+        """
+        for band_idx in range(self.num_bands):
+            self.buckets[band_idx].clear()
 
     def stats(self) -> dict:
         return {
@@ -578,14 +594,18 @@ def prepare_filtered_data(
     val_path = os.path.join(output_dir, "val.bin")
     meta_path = os.path.join(output_dir, "meta.pkl")
 
-    # Copy slices efficiently using memmap
-    train_tokens = np.array(all_tokens[:split_idx], dtype=np.uint32)
-    train_tokens.tofile(train_path)
-    del train_tokens
+    # Chunked file copy to avoid loading entire array into RAM
+    COPY_CHUNK = 5_000_000  # Copy 5M tokens at a time (~20MB)
 
-    val_tokens = np.array(all_tokens[split_idx:], dtype=np.uint32)
-    val_tokens.tofile(val_path)
-    del val_tokens
+    with open(train_path, "wb") as f:
+        for start in range(0, split_idx, COPY_CHUNK):
+            end = min(start + COPY_CHUNK, split_idx)
+            np.array(all_tokens[start:end], dtype=np.uint32).tofile(f)
+
+    with open(val_path, "wb") as f:
+        for start in range(split_idx, len(all_tokens), COPY_CHUNK):
+            end = min(start + COPY_CHUNK, len(all_tokens))
+            np.array(all_tokens[start:end], dtype=np.uint32).tofile(f)
 
     # Cleanup temp file
     del all_tokens
